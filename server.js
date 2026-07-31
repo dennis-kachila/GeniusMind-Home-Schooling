@@ -1,48 +1,229 @@
+// Triggering watch reload for seeding default banners
 const express = require('express');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const path = require('path');
+const fs = require('fs');
 const mysql = require('mysql2/promise');
 const nodemailer = require('nodemailer');
 const bcrypt = require('bcryptjs');
-const fs = require('fs');
 const multer = require('multer');
-const sharp = require('sharp');
+const cors = require('cors');
 require('dotenv').config({ override: true });
+const whatsappService = require('./utils/whatsappService');
+
+// --- Custom Error Logger for cPanel ---
+const logStream = fs.createWriteStream(path.join(__dirname, 'app-errors.log'), { flags: 'a' });
+const originalConsoleError = console.error;
+console.error = function (...args) {
+    originalConsoleError.apply(console, args);
+    const msg = args.map(a => (typeof a === 'object' && a instanceof Error) ? a.stack : (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ');
+    logStream.write(`[${new Date().toISOString()}] ERROR: ${msg}\n`);
+};
+const originalConsoleWarn = console.warn;
+console.warn = function (...args) {
+    originalConsoleWarn.apply(console, args);
+    const msg = args.map(a => (typeof a === 'object' && a instanceof Error) ? a.stack : (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ');
+    logStream.write(`[${new Date().toISOString()}] WARN: ${msg}\n`);
+};
+// --------------------------------------
+
+let sqlite3 = null;
+let sqliteOpen = null;
+let sqliteAvailable = false;
+
+try {
+    sqlite3 = require('sqlite3');
+    sqliteOpen = require('sqlite').open;
+    sqliteAvailable = true;
+} catch (e) {
+    console.warn('⚠️ SQLite local database driver not available (sqlite3/sqlite packages missing).');
+}
+
+// ==========================================
+// MULTER FILE UPLOAD CONFIGURATION
+// ==========================================
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => {
+        const unique = Date.now() + '-' + Math.round(Math.random() * 1e6);
+        cb(null, unique + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB max
+    fileFilter: (req, file, cb) => {
+        // Allow images, PDFs, Word docs, Excel, text files, ZIPs
+        const allowed = /jpeg|jpg|png|gif|webp|pdf|doc|docx|xls|xlsx|txt|zip/;
+        const ext = path.extname(file.originalname).toLowerCase().replace('.', '');
+        if (allowed.test(ext)) return cb(null, true);
+        cb(new Error('File type not allowed.'));
+    }
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- Live Reload for Local Development ---
+if (process.env.NODE_ENV !== 'production') {
+    try {
+        const livereload = require('livereload');
+        const connectLiveReload = require('connect-livereload');
+        const liveReloadServer = livereload.createServer();
+        liveReloadServer.watch(path.join(__dirname));
+
+        // Brief delay on refresh to let backend restart fully
+        liveReloadServer.server.once("connection", () => {
+            setTimeout(() => {
+                liveReloadServer.refresh("/");
+            }, 100);
+        });
+
+        app.use(connectLiveReload());
+        console.log('⚡ Live Reload active for local development.');
+    } catch (e) {
+        console.warn('⚠️ Could not initialize Live Reload:', e.message);
+    }
+}
+
+const allowedOrigins = [
+    'https://www.geniusminds.website',
+    'https://geniusminds.website',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // If origin is null (from redirects) or missing, fallback to the main production domain
+        if (!origin || origin === 'null') {
+            return callback(null, 'https://www.geniusminds.website');
+        }
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, origin);
+        }
+        // Fallback for any other origin
+        return callback(null, 'https://www.geniusminds.website');
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+    credentials: true,
+    optionsSuccessStatus: 200 // For legacy browser support
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // Sessions setup
+const INACTIVITY_TIMEOUT = 15 * 60 * 1000; // 15 minutes of inactivity
+
 app.use(session({
     secret: process.env.SESSION_SECRET || 'genius_minds_secret_key_2026',
     resave: false,
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
+        secure: false, // Allow both HTTP and HTTPS for cPanel compatibility
+        sameSite: 'lax', // More permissive than 'strict'
         maxAge: 24 * 60 * 60 * 1000 // 1 day
     }
 }));
 
+// Middleware: Check for session inactivity and logout if inactive
+app.use((req, res, next) => {
+    if (req.session && req.session.isAdmin) {
+        const now = Date.now();
+        const lastActivity = req.session.lastActivity || now;
+        const timeSinceLastActivity = now - lastActivity;
+
+        // If inactive for longer than INACTIVITY_TIMEOUT, logout
+        if (timeSinceLastActivity > INACTIVITY_TIMEOUT) {
+            console.log(`Admin session expired due to inactivity: ${timeSinceLastActivity}ms > ${INACTIVITY_TIMEOUT}ms`);
+            req.session.destroy((err) => {
+                if (err) console.error('Session destruction error:', err);
+            });
+            res.clearCookie('connect.sid');
+            return res.status(401).json({ error: 'Session expired due to inactivity. Please login again.' });
+        }
+
+        // Update last activity timestamp for this request
+        req.session.lastActivity = now;
+        // Explicitly save the session to ensure it persists
+        req.session.save((err) => {
+            if (err) console.error('Session save error in inactivity check:', err);
+        });
+    }
+    next();
+});
+
 // ==========================================
-// DUAL-MODE DATABASE ADAPTER (MySQL & Memory)
+// DUAL-MODE DATABASE ADAPTER (SQLite & Memory)
 // ==========================================
-let dbMode = 'memory'; // 'mysql' or 'memory'
-let pool = null;
+let dbMode = 'memory'; // 'mysql', 'sqlite', or 'memory'
+let dbPool = null; // MySQL2 connection pool
+let dbConnection = null; // SQLite connection
 
 // In-Memory Database fallback data structures
 const memDb = {
     bookings: [],
     email_logs: [],
+    received_emails: [],
     analytics_sessions: [],
     analytics_events: [],
+    booking_messages: [],
     admin_users: [],
-    highlights_banners: []
+    highlights_banners: [],
+    site_settings: [
+        { setting_key: 'contact_phone', setting_value: '+254 743-322-975' },
+        { setting_key: 'contact_email', setting_value: 'geniusminds2425@gmail.com' },
+        { setting_key: 'contact_location', setting_value: 'Nairobi, Kenya' }
+    ],
+    team_members: [],
+    courses: [],
+    faqs: [],
+    blog_posts: [],
+    page_content: [],
+    social_media: [
+        { id: 1, name: 'TikTok', url: 'https://tiktok.com/@genius.minds.home', icon: null, display_order: 1 },
+        { id: 2, name: 'Instagram', url: 'https://www.instagram.com/genius_minds_homeschool?igsh=aHRsZnk2cjRkaTVv', icon: null, display_order: 2 }
+    ]
 };
+
+// Default dynamic homepage highlights banners seed data
+const defaultBanners = [
+    {
+        badge_text: 'Upcoming Event',
+        badge_class: 'event-badge',
+        title: 'Junior Programmer <span>Bootcamp.</span>',
+        subtitle: "Launch your child's coding journey! Our interactive programmer workshops introduce python, scratch, and web design, building critical logical skills for the future.",
+        btn_primary_action: 'book_session',
+        image_path: 'assets/images/upcoming_coder.png',
+        is_active: 1
+    },
+    {
+        badge_text: 'Outstanding Achievement',
+        badge_class: 'success-badge',
+        title: 'Outstanding IGCSE <span>Triumphs.</span>',
+        subtitle: 'We celebrate academic excellence! Our IGCSE student Esther W. scored an outstanding 98% in Mathematics under customized Genius Minds personal tutoring.',
+        btn_primary_action: 'book_session',
+        image_path: 'assets/images/achievement_trophy.png',
+        is_active: 1
+    },
+    {
+        badge_text: 'Enrollment Announcement',
+        badge_class: 'announce-badge',
+        title: 'Term 3 Admissions <span>Now Open.</span>',
+        subtitle: 'Enrollments for Online, Home-based, and Physical center tutoring classes are open. We support IGCSE, CBE/CBC, and the 8-4-4 systems. Secure your child\'s success today!',
+        btn_primary_action: 'book_session',
+        image_path: 'assets/images/announcement_bell.png',
+        is_active: 1
+    }
+];
 
 // Seed default admin in-memory
 const defaultUsername = process.env.ADMIN_DEFAULT_USER || 'admin';
@@ -55,101 +236,45 @@ memDb.admin_users.push({
     created_at: new Date()
 });
 
-// Seed default highlights banners in-memory
-memDb.highlights_banners = [
-    {
-        id: 1,
-        badge_text: 'Upcoming Event',
-        badge_class: 'event-badge',
-        title: 'Junior Programmer <span>Bootcamp.</span>',
-        subtitle: "Launch your child's coding journey! Our interactive programmer workshops introduce python, scratch, and web design, building critical logical skills for the future.",
-        btn_primary_text: 'Enroll in Coding Program',
-        btn_primary_link: '#contact',
-        btn_secondary_text: 'View Syllabus',
-        btn_secondary_link: '#curriculum',
-        stat_1_number: 'June 15',
-        stat_1_label: 'Start Date',
-        stat_2_number: 'Ages 8-18',
-        stat_2_label: 'Target Groups',
-        stat_3_number: 'Hands-on',
-        stat_3_label: 'Project Based',
-        image_path: 'assets/images/upcoming_coder.png',
-        floating_icon: '💻',
-        floating_title: 'Python & Web',
-        floating_desc: 'Weekend Workshops',
-        glow_class: 'glow-purple',
-        sort_order: 1,
-        is_active: 1,
-        start_date: null,
-        end_date: null,
-        created_at: new Date()
-    },
-    {
-        id: 2,
-        badge_text: 'Outstanding Achievement',
-        badge_class: 'success-badge',
-        title: 'Outstanding IGCSE <span>Triumphs.</span>',
-        subtitle: 'We celebrate academic excellence! Our IGCSE student Esther W. scored an outstanding 98% in Mathematics under customized Genius Minds personal tutoring.',
-        btn_primary_text: 'Request Personal Tutor',
-        btn_primary_link: '#contact',
-        btn_secondary_text: 'Our Success Stories',
-        btn_secondary_link: '#about',
-        stat_1_number: '98%',
-        stat_1_label: 'Highest Score',
-        stat_2_number: 'A+ Grade',
-        stat_2_label: 'Average Performance',
-        stat_3_number: '1-on-1',
-        stat_3_label: 'Personalized Care',
-        image_path: 'assets/images/achievement_trophy.png',
-        floating_icon: '🏆',
-        floating_title: 'IGCSE Maths',
-        floating_desc: 'Esther W. 98%',
-        glow_class: 'glow-green',
-        sort_order: 2,
-        is_active: 1,
-        start_date: null,
-        end_date: null,
-        created_at: new Date()
-    },
-    {
-        id: 3,
-        badge_text: 'Enrollment Announcement',
-        badge_class: 'announce-badge',
-        title: 'Term 3 Admissions <span>Now Open.</span>',
-        subtitle: 'Enrollments for Online, Home-based, and Physical center tutoring classes are open. We support IGCSE, CBE/CBC, and the 8-4-4 systems. Secure your child\'s success today!',
-        btn_primary_text: 'Book a Free Session',
-        btn_primary_link: '#contact',
-        btn_secondary_text: 'Explore Formats',
-        btn_secondary_link: '#services',
-        stat_1_number: 'Active',
-        stat_1_label: 'Admissions Status',
-        stat_2_number: 'Online/Home',
-        stat_2_label: 'Flexible Formats',
-        stat_3_number: 'Affordable',
-        stat_3_label: 'Flexible Payments',
-        image_path: 'assets/images/announcement_bell.png',
-        floating_icon: '🔔',
-        floating_title: 'Admissions Open',
-        floating_desc: 'CBE, IGCSE & 8-4-4',
-        glow_class: 'glow-orange',
-        sort_order: 3,
-        is_active: 1,
-        start_date: null,
-        end_date: null,
-        created_at: new Date()
-    }
-];
+// Seed default banners in-memory
+memDb.highlights_banners = defaultBanners.map((b, idx) => ({
+    id: idx + 1,
+    ...b,
+    start_date: null,
+    end_date: null
+}));
 
-// Helper functions for query/insert operations abstracting MySQL vs Memory
+// Helper functions for query/insert operations abstracting SQLite vs Memory
 const db = {
     async query(sql, params = []) {
         if (dbMode === 'mysql') {
-            const [rows] = await pool.execute(sql, params);
-            return rows;
+            const [rows] = await dbPool.query(sql, params);
+            const isSelect = sql.trim().toUpperCase().startsWith('SELECT');
+            if (isSelect) {
+                return rows;
+            } else {
+                return { insertId: rows.insertId, affectedRows: rows.affectedRows };
+            }
+        } else if (dbMode === 'sqlite') {
+            const sqlUpper = sql.trim().toUpperCase();
+            const isSelect = sqlUpper.startsWith('SELECT');
+
+            // Format ON DUPLICATE KEY UPDATE for SQLite
+            let sqlFormatted = sql;
+            if (sqlUpper.includes('ON DUPLICATE KEY UPDATE')) {
+                sqlFormatted = sql.replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT(session_key) DO UPDATE SET');
+            }
+
+            if (isSelect) {
+                return await dbConnection.all(sqlFormatted, params);
+            } else {
+                const result = await dbConnection.run(sqlFormatted, params);
+                return { insertId: result.lastID, affectedRows: result.changes };
+            }
         } else {
             // Basic SQL parsing/routing to mock collections
             const sqlUpper = sql.trim().toUpperCase();
-            
+
             if (sqlUpper.startsWith('INSERT INTO BOOKINGS')) {
                 const id = memDb.bookings.length + 1;
                 const record = {
@@ -159,13 +284,35 @@ const db = {
                     phone: params[2],
                     service: params[3],
                     message: params[4],
+                    tracking_token: params[5],
                     status: 'pending',
                     created_at: new Date()
                 };
                 memDb.bookings.push(record);
                 return { insertId: id };
             }
-            
+
+            if (sqlUpper.startsWith('INSERT INTO BOOKING_MESSAGES')) {
+                const id = memDb.booking_messages.length + 1;
+                const record = {
+                    id,
+                    booking_id: params[0],
+                    sender: params[1],
+                    message: params[2],
+                    created_at: new Date()
+                };
+                memDb.booking_messages.push(record);
+                return { insertId: id };
+            }
+
+            if (sqlUpper.startsWith('SELECT * FROM BOOKING_MESSAGES WHERE BOOKING_ID')) {
+                return memDb.booking_messages.filter(m => m.booking_id == params[0]).sort((a, b) => a.created_at - b.created_at);
+            }
+
+            if (sqlUpper.startsWith('SELECT * FROM BOOKINGS WHERE TRACKING_TOKEN')) {
+                return memDb.bookings.filter(b => b.tracking_token === params[0]);
+            }
+
             if (sqlUpper.startsWith('INSERT INTO EMAIL_LOGS')) {
                 const id = memDb.email_logs.length + 1;
                 const record = {
@@ -181,7 +328,7 @@ const db = {
                 memDb.email_logs.push(record);
                 return { insertId: id };
             }
-            
+
             if (sqlUpper.startsWith('INSERT INTO ANALYTICS_SESSIONS')) {
                 // Check if session exists
                 const existing = memDb.analytics_sessions.find(s => s.session_key === params[0]);
@@ -264,40 +411,32 @@ const db = {
                 return { affectedRows: 0 };
             }
 
-            if (sqlUpper.startsWith('INSERT INTO BOOKINGS')) {
-                const id = memDb.bookings.length + 1;
-                const record = {
-                    id,
-                    name: params[0],
-                    email: params[1],
-                    phone: params[2],
-                    service: params[3],
-                    message: params[4] || '',
-                    status: 'pending',
-                    created_at: new Date()
-                };
-                memDb.bookings.push(record);
-                return { insertId: id };
-            }
-
-            if (sqlUpper.startsWith('INSERT INTO EMAIL_LOGS')) {
-                const id = memDb.email_logs.length + 1;
-                const record = {
-                    id,
-                    booking_id: params[0],
-                    recipient: params[1],
-                    subject: params[2],
-                    body: params[3],
-                    status: params[4],
-                    error_message: params[5] || null,
-                    created_at: new Date()
-                };
-                memDb.email_logs.push(record);
-                return { insertId: id };
-            }
-
             if (sqlUpper.startsWith('SELECT * FROM EMAIL_LOGS ORDER BY CREATED_AT DESC')) {
                 return [...memDb.email_logs].sort((a, b) => b.created_at - a.created_at);
+            }
+
+            if (sqlUpper.startsWith('INSERT INTO RECEIVED_EMAILS')) {
+                const id = memDb.received_emails.length + 1;
+                const record = {
+                    id,
+                    message_id: params[0],
+                    sender_name: params[1],
+                    sender_email: params[2],
+                    subject: params[3],
+                    body: params[4],
+                    received_at: params[5] || new Date(),
+                    created_at: new Date()
+                };
+                memDb.received_emails.push(record);
+                return { insertId: id };
+            }
+
+            if (sqlUpper.startsWith('SELECT * FROM RECEIVED_EMAILS WHERE MESSAGE_ID')) {
+                return memDb.received_emails.filter(e => e.message_id === params[0]);
+            }
+
+            if (sqlUpper.startsWith('SELECT * FROM RECEIVED_EMAILS ORDER BY RECEIVED_AT DESC')) {
+                return [...memDb.received_emails].sort((a, b) => new Date(b.received_at) - new Date(a.received_at));
             }
 
             if (sqlUpper.startsWith('SELECT * FROM ANALYTICS_SESSIONS')) {
@@ -308,70 +447,52 @@ const db = {
                 return [...memDb.analytics_events].sort((a, b) => b.created_at - a.created_at);
             }
 
+            // --- Highlights Banners ---
             if (sqlUpper.startsWith('SELECT * FROM HIGHLIGHTS_BANNERS')) {
-                return [...memDb.highlights_banners].sort((a, b) => a.sort_order - b.sort_order);
+                return [...memDb.highlights_banners];
             }
 
             if (sqlUpper.startsWith('INSERT INTO HIGHLIGHTS_BANNERS')) {
                 const id = memDb.highlights_banners.length + 1;
                 const record = {
                     id,
-                    badge_text: params[0],
-                    badge_class: params[1],
-                    title: params[2],
-                    subtitle: params[3],
-                    btn_primary_text: params[4],
-                    btn_primary_link: params[5],
-                    btn_secondary_text: params[6],
-                    btn_secondary_link: params[7],
-                    stat_1_number: params[8],
-                    stat_1_label: params[9],
-                    stat_2_number: params[10],
-                    stat_2_label: params[11],
-                    stat_3_number: params[12],
-                    stat_3_label: params[13],
-                    image_path: params[14],
-                    floating_icon: params[15],
-                    floating_title: params[16],
-                    floating_desc: params[17],
-                    glow_class: params[18],
-                    sort_order: params[19] || 0,
-                    is_active: params[20] !== undefined ? params[20] : 1,
-                    start_date: params[21] || null,
-                    end_date: params[22] || null,
-                    created_at: new Date()
+                    banner_type: params[0],
+                    badge_text: params[1],
+                    badge_class: params[2],
+                    title: params[3],
+                    subtitle: params[4],
+                    btn_primary_action: params[5],
+                    btn_secondary_action: params[6],
+                    image_path: params[7],
+                    is_active: params[8] !== undefined ? params[8] : 1,
+                    start_date: params[9] || null,
+                    end_date: params[10] || null
                 };
                 memDb.highlights_banners.push(record);
                 return { insertId: id };
             }
 
-            if (sqlUpper.startsWith('UPDATE HIGHLIGHTS_BANNERS')) {
-                const id = params[23];
+            if (sqlUpper.startsWith('UPDATE HIGHLIGHTS_BANNERS SET IS_ACTIVE')) {
+                const banner = memDb.highlights_banners.find(b => b.id == params[1]);
+                if (banner) {
+                    banner.is_active = params[0];
+                    return { affectedRows: 1 };
+                }
+                return { affectedRows: 0 };
+            }
+
+            if (sqlUpper.startsWith('UPDATE HIGHLIGHTS_BANNERS SET')) {
+                const id = params[11];
                 const banner = memDb.highlights_banners.find(b => b.id == id);
                 if (banner) {
-                    banner.badge_text = params[0];
-                    banner.badge_class = params[1];
-                    banner.title = params[2];
-                    banner.subtitle = params[3];
-                    banner.btn_primary_text = params[4];
-                    banner.btn_primary_link = params[5];
-                    banner.btn_secondary_text = params[6];
-                    banner.btn_secondary_link = params[7];
-                    banner.stat_1_number = params[8];
-                    banner.stat_1_label = params[9];
-                    banner.stat_2_number = params[10];
-                    banner.stat_2_label = params[11];
-                    banner.stat_3_number = params[12];
-                    banner.stat_3_label = params[13];
-                    banner.image_path = params[14];
-                    banner.floating_icon = params[15];
-                    banner.floating_title = params[16];
-                    banner.floating_desc = params[17];
-                    banner.glow_class = params[18];
-                    banner.sort_order = params[19];
-                    banner.is_active = params[20];
-                    banner.start_date = params[21] || null;
-                    banner.end_date = params[22] || null;
+                    banner.banner_type = params[0];
+                    banner.badge_text = params[1]; banner.badge_class = params[2];
+                    banner.title = params[3]; banner.subtitle = params[4];
+                    banner.btn_primary_action = params[5];
+                    banner.btn_secondary_action = params[6];
+                    banner.image_path = params[7];
+                    banner.is_active = params[8]; banner.start_date = params[9];
+                    banner.end_date = params[10];
                     return { affectedRows: 1 };
                 }
                 return { affectedRows: 0 };
@@ -384,13 +505,222 @@ const db = {
                 return { affectedRows: initialLength - memDb.highlights_banners.length };
             }
 
-            if (sqlUpper.startsWith('UPDATE HIGHLIGHTS_BANNERS SET IS_ACTIVE')) {
-                const banner = memDb.highlights_banners.find(b => b.id == params[1]);
-                if (banner) {
-                    banner.is_active = params[0];
+            // --- Site Settings ---
+            if (sqlUpper.startsWith('SELECT SETTING_KEY, SETTING_VALUE FROM SITE_SETTINGS')) {
+                return [...memDb.site_settings];
+            }
+
+            // --- Team Members ---
+            if (sqlUpper.startsWith('SELECT * FROM TEAM_MEMBERS')) {
+                return [...memDb.team_members].sort((a, b) => a.display_order - b.display_order);
+            }
+            if (sqlUpper.startsWith('INSERT INTO TEAM_MEMBERS')) {
+                const id = memDb.team_members.length + 1;
+                const record = {
+                    id,
+                    name: params[0],
+                    role: params[1],
+                    bio: params[2],
+                    image_url: params[3],
+                    display_order: parseInt(params[4]) || 0
+                };
+                memDb.team_members.push(record);
+                return { insertId: id };
+            }
+            if (sqlUpper.startsWith('UPDATE TEAM_MEMBERS SET')) {
+                const id = params[5];
+                const record = memDb.team_members.find(t => t.id == id);
+                if (record) {
+                    record.name = params[0];
+                    record.role = params[1];
+                    record.bio = params[2];
+                    record.image_url = params[3];
+                    record.display_order = parseInt(params[4]) || 0;
                     return { affectedRows: 1 };
                 }
                 return { affectedRows: 0 };
+            }
+            if (sqlUpper.startsWith('DELETE FROM TEAM_MEMBERS')) {
+                const id = params[0];
+                const initialLength = memDb.team_members.length;
+                memDb.team_members = memDb.team_members.filter(t => t.id != id);
+                return { affectedRows: initialLength - memDb.team_members.length };
+            }
+
+            // --- Courses ---
+            if (sqlUpper.startsWith('SELECT * FROM COURSES')) {
+                return [...memDb.courses];
+            }
+            if (sqlUpper.startsWith('INSERT INTO COURSES')) {
+                const id = memDb.courses.length + 1;
+                const record = {
+                    id,
+                    title: params[0],
+                    grade_levels: params[1],
+                    subjects: params[2],
+                    description: params[3],
+                    duration: params[4],
+                    fees: params[5],
+                    outcomes: params[6]
+                };
+                memDb.courses.push(record);
+                return { insertId: id };
+            }
+            if (sqlUpper.startsWith('UPDATE COURSES SET')) {
+                const id = params[7];
+                const record = memDb.courses.find(c => c.id == id);
+                if (record) {
+                    record.title = params[0];
+                    record.grade_levels = params[1];
+                    record.subjects = params[2];
+                    record.description = params[3];
+                    record.duration = params[4];
+                    record.fees = params[5];
+                    record.outcomes = params[6];
+                    return { affectedRows: 1 };
+                }
+                return { affectedRows: 0 };
+            }
+            if (sqlUpper.startsWith('DELETE FROM COURSES')) {
+                const id = params[0];
+                const initialLength = memDb.courses.length;
+                memDb.courses = memDb.courses.filter(c => c.id != id);
+                return { affectedRows: initialLength - memDb.courses.length };
+            }
+
+            // --- FAQs ---
+            if (sqlUpper.startsWith('SELECT * FROM FAQS')) {
+                return [...memDb.faqs].sort((a, b) => a.display_order - b.display_order);
+            }
+            if (sqlUpper.startsWith('INSERT INTO FAQS')) {
+                const id = memDb.faqs.length + 1;
+                const record = {
+                    id,
+                    question: params[0],
+                    answer: params[1],
+                    category: params[2],
+                    display_order: parseInt(params[3]) || 0
+                };
+                memDb.faqs.push(record);
+                return { insertId: id };
+            }
+            if (sqlUpper.startsWith('UPDATE FAQS SET')) {
+                const id = params[4];
+                const record = memDb.faqs.find(f => f.id == id);
+                if (record) {
+                    record.question = params[0];
+                    record.answer = params[1];
+                    record.category = params[2];
+                    record.display_order = parseInt(params[3]) || 0;
+                    return { affectedRows: 1 };
+                }
+                return { affectedRows: 0 };
+            }
+            if (sqlUpper.startsWith('DELETE FROM FAQS')) {
+                const id = params[0];
+                const initialLength = memDb.faqs.length;
+                memDb.faqs = memDb.faqs.filter(f => f.id != id);
+                return { affectedRows: initialLength - memDb.faqs.length };
+            }
+
+            // --- Blog Posts ---
+            if (sqlUpper.startsWith('SELECT * FROM BLOG_POSTS')) {
+                return [...memDb.blog_posts].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            }
+            if (sqlUpper.startsWith('INSERT INTO BLOG_POSTS')) {
+                const id = memDb.blog_posts.length + 1;
+                const record = {
+                    id,
+                    title: params[0],
+                    excerpt: params[1],
+                    content: params[2],
+                    author: params[3],
+                    category: params[4],
+                    image_url: params[5],
+                    created_at: new Date()
+                };
+                memDb.blog_posts.push(record);
+                return { insertId: id };
+            }
+            if (sqlUpper.startsWith('UPDATE BLOG_POSTS SET')) {
+                const id = params[6];
+                const record = memDb.blog_posts.find(b => b.id == id);
+                if (record) {
+                    record.title = params[0];
+                    record.excerpt = params[1];
+                    record.content = params[2];
+                    record.author = params[3];
+                    record.category = params[4];
+                    record.image_url = params[5];
+                    return { affectedRows: 1 };
+                }
+                return { affectedRows: 0 };
+            }
+            if (sqlUpper.startsWith('DELETE FROM BLOG_POSTS')) {
+                const id = params[0];
+                const initialLength = memDb.blog_posts.length;
+                memDb.blog_posts = memDb.blog_posts.filter(b => b.id != id);
+                return { affectedRows: initialLength - memDb.blog_posts.length };
+            }
+
+            // --- Page Content ---
+            if (sqlUpper.startsWith('SELECT * FROM PAGE_CONTENT')) {
+                return [...memDb.page_content];
+            }
+            if (sqlUpper.startsWith('INSERT INTO PAGE_CONTENT') || sqlUpper.startsWith('INSERT OR REPLACE INTO PAGE_CONTENT')) {
+                const key = params[0];
+                const val = params[1];
+                const existing = memDb.page_content.find(p => p.content_key === key);
+                if (existing) {
+                    existing.content_value = val;
+                    existing.updated_at = new Date();
+                    return { affectedRows: 1 };
+                } else {
+                    const id = memDb.page_content.length + 1;
+                    memDb.page_content.push({
+                        id,
+                        content_key: key,
+                        content_value: val,
+                        created_at: new Date(),
+                        updated_at: new Date()
+                    });
+                    return { insertId: id };
+                }
+            }
+
+            // --- Social Media ---
+            if (sqlUpper.startsWith('SELECT * FROM SOCIAL_MEDIA')) {
+                return [...memDb.social_media].sort((a, b) => a.display_order - b.display_order);
+            }
+            if (sqlUpper.startsWith('INSERT INTO SOCIAL_MEDIA')) {
+                const id = memDb.social_media.length > 0 ? Math.max(...memDb.social_media.map(s => s.id)) + 1 : 1;
+                const record = {
+                    id,
+                    name: params[0],
+                    url: params[1],
+                    icon: params[2] || null,
+                    display_order: parseInt(params[3]) || 0
+                };
+                memDb.social_media.push(record);
+                return { insertId: id };
+            }
+            if (sqlUpper.startsWith('UPDATE SOCIAL_MEDIA SET')) {
+                const id = params[4];
+                const record = memDb.social_media.find(s => s.id == id);
+                if (record) {
+                    record.name = params[0];
+                    record.url = params[1];
+                    record.icon = params[2] || null;
+                    record.display_order = parseInt(params[3]) || 0;
+                    return { affectedRows: 1 };
+                }
+                return { affectedRows: 0 };
+            }
+            if (sqlUpper.startsWith('DELETE FROM SOCIAL_MEDIA')) {
+                const id = params[0];
+                const initialLength = memDb.social_media.length;
+                memDb.social_media = memDb.social_media.filter(s => s.id != id);
+                return { affectedRows: initialLength - memDb.social_media.length };
             }
 
             return [];
@@ -400,197 +730,634 @@ const db = {
 
 // Initial database connection and tables creation
 async function initDatabase() {
-    const dbConfig = {
-        host: process.env.DB_HOST || '127.0.0.1',
-        port: parseInt(process.env.DB_PORT || '3306'),
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || ''
-    };
+    const isProduction = process.env.NODE_ENV === 'production';
 
-    try {
-        console.log('🔄 Connecting to MySQL server...');
-        // First connect without database name to ensure db exists
-        const tempConn = await mysql.createConnection(dbConfig);
-        await tempConn.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME || 'genius_minds_db'}\``);
-        await tempConn.end();
-
-        // Connect to the specific database
-        pool = mysql.createPool({
-            ...dbConfig,
-            database: process.env.DB_NAME || 'genius_minds_db',
-            waitForConnections: true,
-            connectionLimit: 10,
-            queueLimit: 0
-        });
-
-        // Initialize Tables
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS bookings (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                service VARCHAR(100) NOT NULL,
-                message TEXT,
-                status VARCHAR(50) DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS email_logs (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                booking_id INT,
-                recipient VARCHAR(255) NOT NULL,
-                subject VARCHAR(255) NOT NULL,
-                body TEXT,
-                status VARCHAR(50) NOT NULL,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS analytics_sessions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                session_key VARCHAR(255) UNIQUE NOT NULL,
-                ip_address VARCHAR(100),
-                user_agent TEXT,
-                browser VARCHAR(100),
-                os VARCHAR(100),
-                device VARCHAR(100),
-                referrer TEXT,
-                country_name VARCHAR(100) DEFAULT 'Kenya',
-                country_flag VARCHAR(10) DEFAULT '🇰🇪',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-            )
-        `);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS analytics_events (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                session_key VARCHAR(255) NOT NULL,
-                event_type VARCHAR(100) NOT NULL,
-                event_name VARCHAR(100) NOT NULL,
-                event_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS admin_users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(100) UNIQUE NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS highlights_banners (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                badge_text VARCHAR(255) NOT NULL,
-                badge_class VARCHAR(100) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                subtitle TEXT NOT NULL,
-                btn_primary_text VARCHAR(255),
-                btn_primary_link VARCHAR(255),
-                btn_secondary_text VARCHAR(255),
-                btn_secondary_link VARCHAR(255),
-                stat_1_number VARCHAR(100),
-                stat_1_label VARCHAR(100),
-                stat_2_number VARCHAR(100),
-                stat_2_label VARCHAR(100),
-                stat_3_number VARCHAR(100),
-                stat_3_label VARCHAR(100),
-                image_path VARCHAR(255) NOT NULL,
-                floating_icon VARCHAR(10),
-                floating_title VARCHAR(255),
-                floating_desc VARCHAR(255),
-                glow_class VARCHAR(100) NOT NULL,
-                sort_order INT DEFAULT 0,
-                is_active TINYINT DEFAULT 1,
-                start_date DATETIME NULL,
-                end_date DATETIME NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        // Run migrations/ALTER commands to update existing DB if tables already existed
+    if (isProduction) {
+        // ==========================================
+        // PRODUCTION DATABASE INIT: MySQL ONLY
+        // ==========================================
         try {
-            await pool.query("ALTER TABLE analytics_sessions ADD COLUMN country_name VARCHAR(100) DEFAULT 'Kenya'");
-        } catch (e) { /* ignore duplicate column */ }
-        try {
-            await pool.query("ALTER TABLE analytics_sessions ADD COLUMN country_flag VARCHAR(10) DEFAULT '🇰🇪'");
-        } catch (e) { /* ignore duplicate column */ }
-        try {
-            await pool.query("ALTER TABLE highlights_banners ADD COLUMN is_active TINYINT DEFAULT 1");
-        } catch (e) { /* ignore */ }
-        try {
-            await pool.query("ALTER TABLE highlights_banners ADD COLUMN start_date DATETIME NULL");
-        } catch (e) { /* ignore */ }
-        try {
-            await pool.query("ALTER TABLE highlights_banners ADD COLUMN end_date DATETIME NULL");
-        } catch (e) { /* ignore */ }
+            console.log('🔄 [Production] Connecting to MySQL database...');
 
-        // Check if admin user exists, if not seed default
-        const [rows] = await pool.query('SELECT * FROM admin_users WHERE username = ?', [defaultUsername]);
-        if (rows.length === 0) {
-            await pool.query('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', [
-                defaultUsername,
-                defaultPasswordHash
-            ]);
-            console.log(`👤 Seeded default admin user: "${defaultUsername}" / "${defaultPassword}"`);
-        }
+            dbPool = await mysql.createPool({
+                host: process.env.DB_HOST || '127.0.0.1',
+                port: parseInt(process.env.DB_PORT || '3306'),
+                user: process.env.DB_USER || 'root',
+                password: process.env.DB_PASSWORD || '',
+                database: process.env.DB_NAME || 'genius_minds_db',
+                waitForConnections: true,
+                connectionLimit: 10,
+                queueLimit: 0,
+                charset: 'utf8mb4'
+            });
 
-        // Check if highlights_banners is empty, if so seed defaults
-        const [bannerRows] = await pool.query('SELECT COUNT(*) as count FROM highlights_banners');
-        if (bannerRows[0].count === 0) {
-            const defaultBanners = [
-                [
-                    'Upcoming Event', 'event-badge', 'Junior Programmer <span>Bootcamp.</span>',
-                    "Launch your child's coding journey! Our interactive programmer workshops introduce python, scratch, and web design, building critical logical skills for the future.",
-                    'Enroll in Coding Program', '#contact', 'View Syllabus', '#curriculum',
-                    'June 15', 'Start Date', 'Ages 8-18', 'Target Groups', 'Hands-on', 'Project Based',
-                    'assets/images/upcoming_coder.png', '💻', 'Python & Web', 'Weekend Workshops', 'glow-purple', 1, 1, null, null
-                ],
-                [
-                    'Outstanding Achievement', 'success-badge', 'Outstanding IGCSE <span>Triumphs.</span>',
-                    'We celebrate academic excellence! Our IGCSE student Esther W. scored an outstanding 98% in Mathematics under customized Genius Minds personal tutoring.',
-                    'Request Personal Tutor', '#contact', 'Our Success Stories', '#about',
-                    '98%', 'Highest Score', 'A+ Grade', 'Average Performance', '1-on-1', 'Personalized Care',
-                    'assets/images/achievement_trophy.png', '🏆', 'IGCSE Maths', 'Esther W. 98%', 'glow-green', 2, 1, null, null
-                ],
-                [
-                    'Enrollment Announcement', 'announce-badge', 'Term 3 Admissions <span>Now Open.</span>',
-                    'Enrollments for Online, Home-based, and Physical center tutoring classes are open. We support IGCSE, CBE/CBC, and the 8-4-4 systems. Secure your child\'s success today!',
-                    'Book a Free Session', '#contact', 'Explore Formats', '#services',
-                    'Active', 'Admissions Status', 'Online/Home', 'Flexible Formats', 'Affordable', 'Flexible Payments',
-                    'assets/images/announcement_bell.png', '🔔', 'Admissions Open', 'CBE, IGCSE & 8-4-4', 'glow-orange', 3, 1, null, null
-                ]
-            ];
+            // Test connection
+            await dbPool.query('SELECT 1');
 
-            for (const banner of defaultBanners) {
-                await pool.query(`
-                    INSERT INTO highlights_banners (
-                        badge_text, badge_class, title, subtitle,
-                        btn_primary_text, btn_primary_link, btn_secondary_text, btn_secondary_link,
-                        stat_1_number, stat_1_label, stat_2_number, stat_2_label, stat_3_number, stat_3_label,
-                        image_path, floating_icon, floating_title, floating_desc, glow_class, sort_order,
-                        is_active, start_date, end_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `, banner);
+            // Create MySQL Tables
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS bookings (
+                    id              INT NOT NULL AUTO_INCREMENT,
+                    name            VARCHAR(255) NOT NULL,
+                    email           VARCHAR(255) NOT NULL,
+                    phone           VARCHAR(50)  NOT NULL,
+                    service         VARCHAR(255) NOT NULL,
+                    message         TEXT,
+                    tracking_token  VARCHAR(64)  DEFAULT NULL,
+                    status          VARCHAR(50)  DEFAULT 'pending',
+                    created_at      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY idx_tracking_token (tracking_token)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS booking_messages (
+                    id              INT NOT NULL AUTO_INCREMENT,
+                    booking_id      INT NOT NULL,
+                    sender          VARCHAR(50)  NOT NULL,
+                    message         TEXT         NOT NULL,
+                    attachment_url  VARCHAR(500) DEFAULT NULL,
+                    attachment_name VARCHAR(255) DEFAULT NULL,
+                    created_at      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS email_logs (
+                    id            INT NOT NULL AUTO_INCREMENT,
+                    booking_id    INT          DEFAULT NULL,
+                    recipient     VARCHAR(255) NOT NULL,
+                    subject       VARCHAR(500) NOT NULL,
+                    body          LONGTEXT,
+                    status        VARCHAR(50)  NOT NULL,
+                    error_message TEXT         DEFAULT NULL,
+                    created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS analytics_sessions (
+                    id           INT NOT NULL AUTO_INCREMENT,
+                    session_key  VARCHAR(255) NOT NULL,
+                    ip_address   VARCHAR(45)  DEFAULT NULL,
+                    user_agent   TEXT,
+                    browser      VARCHAR(100) DEFAULT NULL,
+                    os           VARCHAR(100) DEFAULT NULL,
+                    device       VARCHAR(100) DEFAULT NULL,
+                    referrer     TEXT,
+                    country_name VARCHAR(100) DEFAULT 'Kenya',
+                    country_flag VARCHAR(20)  DEFAULT '🇰🇪',
+                    created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                    updated_at   DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY idx_session_key (session_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS analytics_events (
+                    id          INT NOT NULL AUTO_INCREMENT,
+                    session_key VARCHAR(255) NOT NULL,
+                    event_type  VARCHAR(100) NOT NULL,
+                    event_name  VARCHAR(255) NOT NULL,
+                    event_data  TEXT,
+                    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS admin_users (
+                    id            INT NOT NULL AUTO_INCREMENT,
+                    username      VARCHAR(100) NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY idx_username (username)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS received_emails (
+                    id           INT NOT NULL AUTO_INCREMENT,
+                    message_id   VARCHAR(255) NOT NULL,
+                    sender_name  VARCHAR(255) DEFAULT NULL,
+                    sender_email VARCHAR(255) NOT NULL,
+                    subject      VARCHAR(500) DEFAULT NULL,
+                    body         LONGTEXT,
+                    received_at  DATETIME     DEFAULT NULL,
+                    created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY idx_message_id (message_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS highlights_banners (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    banner_type VARCHAR(100) DEFAULT NULL,
+                    badge_text VARCHAR(255) NOT NULL,
+                    badge_class VARCHAR(100) NOT NULL DEFAULT 'event-badge',
+                    title VARCHAR(255) NOT NULL,
+                    subtitle TEXT NOT NULL,
+                    btn_primary_action VARCHAR(100) DEFAULT NULL,
+                    btn_secondary_action VARCHAR(100) DEFAULT NULL,
+                    image_path VARCHAR(500) DEFAULT NULL,
+                    is_active TINYINT DEFAULT 1,
+                    start_date DATETIME DEFAULT NULL,
+                    end_date DATETIME DEFAULT NULL,
+                    event_start_date DATE DEFAULT NULL,
+                    event_end_date DATE DEFAULT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            // Add event date columns if they don't exist (migration for existing databases)
+            try { await dbPool.query("ALTER TABLE highlights_banners ADD COLUMN event_start_date DATE DEFAULT NULL"); } catch (e) { }
+            try { await dbPool.query("ALTER TABLE highlights_banners ADD COLUMN event_end_date DATE DEFAULT NULL"); } catch (e) { }
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS team_members (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    role VARCHAR(255) NOT NULL,
+                    bio TEXT DEFAULT NULL,
+                    image_url VARCHAR(500) DEFAULT NULL,
+                    display_order INT DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS courses (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    grade_levels VARCHAR(255) DEFAULT NULL,
+                    subjects TEXT DEFAULT NULL,
+                    description TEXT DEFAULT NULL,
+                    duration VARCHAR(255) DEFAULT NULL,
+                    fees VARCHAR(255) DEFAULT NULL,
+                    outcomes TEXT DEFAULT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS faqs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    category VARCHAR(255) DEFAULT NULL,
+                    display_order INT DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS blog_posts (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    excerpt TEXT DEFAULT NULL,
+                    content LONGTEXT DEFAULT NULL,
+                    author VARCHAR(255) DEFAULT NULL,
+                    category VARCHAR(255) DEFAULT NULL,
+                    image_url VARCHAR(500) DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS page_content (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    content_key VARCHAR(255) NOT NULL,
+                    content_value TEXT DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY idx_content_key (content_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS site_settings (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    setting_key VARCHAR(255) NOT NULL,
+                    setting_value TEXT DEFAULT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY idx_setting_key (setting_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            // Seed default settings in MySQL if empty
+            const [settingsCount] = await dbPool.query('SELECT COUNT(*) as count FROM site_settings');
+            if (settingsCount[0].count === 0) {
+                await dbPool.query(`
+                    INSERT INTO site_settings (setting_key, setting_value) VALUES 
+                    ('contact_phone', '+254 743-322-975'),
+                    ('contact_email', 'geniusminds2425@gmail.com'),
+                    ('contact_location', 'Nairobi, Kenya')
+                `);
+                console.log('✨ Seeded default site settings in MySQL.');
             }
-            console.log('✨ Seeded default highlights banners in MySQL.');
+
+            await dbPool.query(`
+                CREATE TABLE IF NOT EXISTS social_media (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    url VARCHAR(500) NOT NULL,
+                    icon VARCHAR(100) DEFAULT NULL,
+                    display_order INT DEFAULT 0
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            `);
+
+            // Seed default social media in MySQL if empty
+            const [socialCount] = await dbPool.query('SELECT COUNT(*) as count FROM social_media');
+            if (socialCount[0].count === 0) {
+                await dbPool.query(`
+                    INSERT INTO social_media (name, url, display_order) VALUES
+                    ('TikTok', 'https://tiktok.com/@genius.minds.home', 1),
+                    ('Instagram', 'https://www.instagram.com/genius_minds_homeschool?igsh=aHRsZnk2cjRkaTVv', 2)
+                `);
+                console.log('✨ Seeded default social media links in MySQL.');
+            }
+
+            try { await dbPool.query("ALTER TABLE analytics_sessions ADD COLUMN country_name VARCHAR(100) DEFAULT 'Kenya'"); } catch (e) { }
+            try { await dbPool.query("ALTER TABLE analytics_sessions ADD COLUMN country_flag VARCHAR(20) DEFAULT '🇰🇪'"); } catch (e) { }
+            try { await dbPool.query("ALTER TABLE booking_messages ADD COLUMN attachment_url VARCHAR(500) DEFAULT NULL"); } catch (e) { }
+            try { await dbPool.query("ALTER TABLE booking_messages ADD COLUMN attachment_name VARCHAR(255) DEFAULT NULL"); } catch (e) { }
+
+            // Seed default admin user if missing
+            const [rows] = await dbPool.query('SELECT id FROM admin_users WHERE username = ?', [defaultUsername]);
+            if (rows.length === 0) {
+                await dbPool.query('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', [
+                    defaultUsername,
+                    defaultPasswordHash
+                ]);
+                console.log(`👤 Seeded default admin user in MySQL: "${defaultUsername}" / "${defaultPassword}"`);
+            }
+
+            // Seed default banners if empty
+            const [bannerRows] = await dbPool.query('SELECT COUNT(*) as count FROM highlights_banners');
+            if (bannerRows[0].count === 0) {
+                for (const banner of defaultBanners) {
+                    await dbPool.query(`
+                        INSERT INTO highlights_banners
+                            (badge_text, badge_class, title, subtitle, btn_primary_action, image_path, is_active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        [banner.badge_text, banner.badge_class, banner.title, banner.subtitle,
+                        banner.btn_primary_action, banner.image_path, banner.is_active]
+                    );
+                }
+                console.log('✨ Seeded default highlights banners in MySQL.');
+            }
+
+            dbMode = 'mysql';
+            console.log('✅ Connected to MySQL successfully. Running in PRODUCTION database mode.');
+        } catch (err) {
+            console.error('❌ [Production] MySQL Connection Failed:', err.message);
+            console.warn('⚠️ Falling back to IN-MEMORY storage. Data will reset on restart.');
+            dbMode = 'memory';
+        }
+    } else {
+        // ==========================================
+        // DEVELOPMENT DATABASE INIT: SQLite ONLY
+        // ==========================================
+        if (sqliteAvailable) {
+            try {
+                console.log('🔄 [Development] Connecting to SQLite local database...');
+                dbConnection = await sqliteOpen({
+                    filename: './database.sqlite',
+                    driver: sqlite3.Database
+                });
+
+                // Create SQLite Tables
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS bookings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        phone TEXT NOT NULL,
+                        service TEXT NOT NULL,
+                        message TEXT,
+                        tracking_token TEXT UNIQUE,
+                        status TEXT DEFAULT 'pending',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS booking_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        booking_id INTEGER NOT NULL,
+                        sender TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        attachment_url TEXT DEFAULT NULL,
+                        attachment_name TEXT DEFAULT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS email_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        booking_id INTEGER DEFAULT NULL,
+                        recipient TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        body TEXT,
+                        status TEXT NOT NULL,
+                        error_message TEXT DEFAULT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS analytics_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_key TEXT UNIQUE NOT NULL,
+                        ip_address TEXT,
+                        user_agent TEXT,
+                        browser TEXT,
+                        os TEXT,
+                        device TEXT,
+                        referrer TEXT,
+                        country_name TEXT DEFAULT 'Kenya',
+                        country_flag TEXT DEFAULT '🇰🇪',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS analytics_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_key TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        event_name TEXT NOT NULL,
+                        event_data TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS admin_users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS received_emails (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id TEXT UNIQUE NOT NULL,
+                        sender_name TEXT,
+                        sender_email TEXT NOT NULL,
+                        subject TEXT,
+                        body TEXT,
+                        received_at DATETIME,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS highlights_banners (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        banner_type TEXT DEFAULT NULL,
+                        badge_text TEXT NOT NULL,
+                        badge_class TEXT NOT NULL DEFAULT 'event-badge',
+                        title TEXT NOT NULL,
+                        subtitle TEXT NOT NULL,
+                        btn_primary_action TEXT DEFAULT NULL,
+                        btn_secondary_action TEXT DEFAULT NULL,
+                        image_path TEXT DEFAULT NULL,
+                        is_active INTEGER DEFAULT 1,
+                        start_date DATETIME DEFAULT NULL,
+                        end_date DATETIME DEFAULT NULL,
+                        event_start_date DATE DEFAULT NULL,
+                        event_end_date DATE DEFAULT NULL
+                    )
+                `);
+
+                // Add event date columns if they don't exist (migration for existing databases)
+                try {
+                    await dbConnection.run(`ALTER TABLE highlights_banners ADD COLUMN event_start_date DATE DEFAULT NULL`);
+                } catch (e) { }
+                try {
+                    await dbConnection.run(`ALTER TABLE highlights_banners ADD COLUMN event_end_date DATE DEFAULT NULL`);
+                } catch (e) { }
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS site_settings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        setting_key TEXT UNIQUE NOT NULL,
+                        setting_value TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS team_members (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        bio TEXT,
+                        image_url TEXT,
+                        display_order INTEGER DEFAULT 0
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS courses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL,
+                        grade_levels TEXT,
+                        subjects TEXT,
+                        description TEXT,
+                        duration TEXT,
+                        fees TEXT,
+                        outcomes TEXT
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS faqs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        question TEXT NOT NULL,
+                        answer TEXT NOT NULL,
+                        category TEXT,
+                        display_order INTEGER DEFAULT 0
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS blog_posts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL,
+                        excerpt TEXT,
+                        content TEXT,
+                        author TEXT,
+                        category TEXT,
+                        image_url TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS page_content (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        content_key TEXT UNIQUE NOT NULL,
+                        content_value TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `);
+
+                await dbConnection.run(`
+                    INSERT OR IGNORE INTO site_settings (setting_key, setting_value) VALUES 
+                    ('contact_phone', '+254 743-322-975'),
+                    ('contact_email', 'geniusminds2425@gmail.com'),
+                    ('contact_location', 'Nairobi, Kenya')
+                `);
+
+                await dbConnection.run(`
+                    CREATE TABLE IF NOT EXISTS social_media (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        url TEXT NOT NULL,
+                        icon TEXT DEFAULT NULL,
+                        display_order INTEGER DEFAULT 0
+                    )
+                `);
+
+                // Seed default social media in SQLite if empty
+                const socialCount = await dbConnection.get('SELECT COUNT(*) as count FROM social_media');
+                if (socialCount.count === 0) {
+                    await dbConnection.run(`INSERT INTO social_media (name, url, display_order) VALUES ('TikTok', 'https://tiktok.com/@genius.minds.home', 1)`);
+                    await dbConnection.run(`INSERT INTO social_media (name, url, display_order) VALUES ('Instagram', 'https://www.instagram.com/genius_minds_homeschool?igsh=aHRsZnk2cjRkaTVv', 2)`);
+                    console.log('✨ Seeded default social media links in SQLite.');
+                }
+
+                const bannerCount = await dbConnection.get('SELECT COUNT(*) as count FROM highlights_banners');
+                if (bannerCount.count === 0) {
+                    for (const banner of defaultBanners) {
+                        await dbConnection.run(`
+                            INSERT INTO highlights_banners
+                                (badge_text, badge_class, title, subtitle, btn_primary_action, image_path, is_active)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                            [banner.badge_text, banner.badge_class, banner.title, banner.subtitle,
+                            banner.btn_primary_action, banner.image_path, banner.is_active]
+                        );
+                    }
+                    console.log('✨ Seeded default highlights banners in SQLite.');
+                }
+
+                // Seed default admin in SQLite if missing
+                const rows = await dbConnection.all('SELECT id FROM admin_users WHERE username = ?', [defaultUsername]);
+                if (rows.length === 0) {
+                    await dbConnection.run('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', [
+                        defaultUsername,
+                        defaultPasswordHash
+                    ]);
+                    console.log(`👤 Seeded default admin user in SQLite: "${defaultUsername}" / "${defaultPassword}"`);
+                }
+
+                dbMode = 'sqlite';
+                console.log('✅ Connected to SQLite successfully. Running in DEVELOPMENT database mode.');
+            } catch (sqliteErr) {
+                console.error('❌ [Development] SQLite Connection/Initialization Failed:', sqliteErr.message);
+                console.warn('⚠️ Falling back to IN-MEMORY storage. Data will reset on restart.');
+                dbMode = 'memory';
+            }
+        } else {
+            console.warn('⚠️ [Development] SQLite driver not available. Falling back to IN-MEMORY storage.');
         }
 
-        dbMode = 'mysql';
-        console.log('✅ Connected to MySQL successfully. Running in DATABASE mode.');
+        // Seed default CMS data
+        await seedDefaultCMSData();
+    }
+}
+
+// Helper to seed default CMS data if tables are empty
+async function seedDefaultCMSData() {
+    try {
+        // 1. Team Members
+        const team = await db.query('SELECT * FROM team_members');
+        if (team.length === 0) {
+            await db.query('INSERT INTO team_members (name, role, bio, image_url, display_order) VALUES (?, ?, ?, ?, ?)',
+                ['Esther W.', 'Lead Science & Mathematics Tutor', 'Esther is a passionate educator with over 8 years of tutoring experience in the British IGCSE curriculum. She holds a B.Ed. in Mathematics & Physics.', 'assets/images/team-1.jpg', 1]
+            );
+            await db.query('INSERT INTO team_members (name, role, bio, image_url, display_order) VALUES (?, ?, ?, ?, ?)',
+                ['David N.', 'Primary CBC Specialist', 'David specializes in active learning and competency-based curriculum development. He has helped dozens of primary learners build confidence in mathematics and technology.', 'assets/images/team-2.jpg', 2]
+            );
+            await db.query('INSERT INTO team_members (name, role, bio, image_url, display_order) VALUES (?, ?, ?, ?, ?)',
+                ['Grace M.', 'English & Languages Tutor', 'Grace is a certified ESL trainer and literature enthusiast. She works with secondary students on writing excellence, comprehension skills, and literary analysis.', 'assets/images/team-3.jpg', 3]
+            );
+            console.log('✨ Seeded default CMS Team Members.');
+        }
+
+        // 2. Courses
+        const courses = await db.query('SELECT * FROM courses');
+        if (courses.length === 0) {
+            await db.query('INSERT INTO courses (title, grade_levels, subjects, description, duration, fees, outcomes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                ['IGCSE Prep & Support', 'Year 9 - Year 11 (High School)', 'Mathematics, Physics, Chemistry, Biology, English', 'Comprehensive preparation for IGCSE board examinations. Includes past paper practice, mock testing, and conceptual breakdown.', 'Flexible (hourly/weekly)', 'From KES 2,500/hour', 'Thorough understanding of syllabus, exam confidence, and top grades.']
+            );
+            await db.query('INSERT INTO courses (title, grade_levels, subjects, description, duration, fees, outcomes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                ['CBC / CBE Enrichment', 'Grade 1 - Grade 9', 'Core CBE Subjects, Mathematics, Science & Tech', 'Hands-on, competency-based support to reinforce school learning and complete project tasks efficiently.', 'Flexible (hourly/weekly)', 'From KES 1,800/hour', 'Enhanced creative and critical thinking, timely project completion.']
+            );
+            await db.query('INSERT INTO courses (title, grade_levels, subjects, description, duration, fees, outcomes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                ['8-4-4 / KCSE Support', 'Primary & Secondary', 'Mathematics, Sciences, English, Kiswahili', 'Traditional system support focusing on KCSE exam success and reinforcing core concepts.', 'Flexible (hourly/weekly)', 'From KES 1,800/hour', 'High score targets, solid subject foundation.']
+            );
+            console.log('✨ Seeded default CMS Courses.');
+        }
+
+        // 3. FAQs
+        const faqs = await db.query('SELECT * FROM faqs');
+        if (faqs.length === 0) {
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['How do I get started with Genius Minds?', 'Getting started is simple! Just fill out our booking form at the bottom of the page or call us directly. We will schedule a free initial assessment to understand your child\'s needs and match them with the perfect tutor.', 'General', 1]
+            );
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['Do you offer physical in-person home tutoring or online classes?', 'We offer both! We provide in-person tutoring where our qualified tutors visit your home in Nairobi (Karen, Runda, Westlands, Kilimani, etc.), online interactive tutoring for students globally, and physical classes at our structured learning center.', 'Programs', 2]
+            );
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['Which curricula do you support?', 'We support all major curricula, including British International (IGCSE/GCSE), Competency-Based Curriculum (CBC), the traditional Kenyan 8-4-4 system, and the US Curriculum.', 'Curriculum', 3]
+            );
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['How are your tutors selected and vetted?', 'All our tutors are university graduates, certified educators, or subject-matter experts. They undergo rigorous background checks, reference checks, and interview vetting to ensure safety, reliability, and academic excellence.', 'Tutors', 4]
+            );
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['Can we schedule classes on weekends or evenings?', 'Yes, our schedules are highly flexible. We customize tutoring sessions to fit your family\'s routine, offering classes during weekdays, evenings, or weekends.', 'Scheduling', 5]
+            );
+            await db.query('INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+                ['How do you track my child\'s academic progress?', 'We provide detailed weekly progress reports to parents, regular mock assessments to track understanding, and continuous feedback directly from the tutor after each session.', 'Assessment', 6]
+            );
+            console.log('✨ Seeded default CMS FAQs.');
+        }
+
+        // 4. Blog Posts
+        const blogs = await db.query('SELECT * FROM blog_posts');
+        if (blogs.length === 0) {
+            await db.query('INSERT INTO blog_posts (title, excerpt, content, author, category, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+                ['The Rise of Homeschooling in Kenya', 'Why more parents in Nairobi are opting for personalized homeschooling programs for their children.', 'Homeschooling is rapidly growing in popularity across Kenya. Parents seek flexible scheduling, customized pacing, safety, and a focused environment. Our systems, like IGCSE and CBC, adapt perfectly to home tutoring. By matching students with certified tutors who understand the specific curriculum, we make transition seamless and results outstanding.', 'Admin Team', 'Education Trends', 'assets/images/blog-1.jpg']
+            );
+            await db.query('INSERT INTO blog_posts (title, excerpt, content, author, category, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+                ['Tips for Preparing Your Child for IGCSE Exams', 'Practical strategies and study tips from our lead mathematics and sciences tutors to boost exam performance.', 'Preparing for IGCSE board exams requires a structured revision plan, extensive practice with past papers, and continuous feedback. Here are the top five strategies recommended by our instructors:\n\n1. Start early: Do not wait until the final months.\n2. Do active recall: Test knowledge rather than passively reading.\n3. Master past papers: Understand examiner mark schemes.\n4. Build exam stamina: Take timed mock tests.\n5. Address weak spots immediately: Work one-on-one with a tutor.', 'Esther W.', 'Study Tips', 'assets/images/blog-2.jpg']
+            );
+            console.log('✨ Seeded default CMS Blog Posts.');
+        }
+
+        // 5. Page Content
+        const content = await db.query('SELECT * FROM page_content');
+        if (content.length === 0) {
+            await db.query('INSERT INTO page_content (content_key, content_value) VALUES (?, ?)', ['mission_statement', 'Dedicated to providing high-quality and affordable tutoring services for learners of all ages.']);
+            await db.query('INSERT INTO page_content (content_key, content_value) VALUES (?, ?)', ['vision', 'To be the leading personalized homeschooling partner in East Africa, unlocking every student\'s full potential.']);
+            await db.query('INSERT INTO page_content (content_key, content_value) VALUES (?, ?)', ['history', 'Genius Minds Homeschooling was founded to bridge learning gaps for students in Nairobi. Starting with a few local students, we have expanded to support over 120+ families both locally and internationally, providing high-standard tutoring across various systems.']);
+            await db.query('INSERT INTO page_content (content_key, content_value) VALUES (?, ?)', ['teaching_philosophy', 'We believe education is not one-size-fits-all. Our approach centers on personalized instruction, building confidence, practical skill acquisition, and close parent-tutor communication.']);
+            console.log('✨ Seeded default CMS Page Content.');
+        }
     } catch (err) {
-        console.error('⚠️ MySQL Connection Failed:', err.message);
-        console.warn('⚠️ Falling back to IN-MEMORY storage. All database operations will work but will reset on server restart.');
-        dbMode = 'memory';
+        console.error('⚠️ Error seeding default CMS data:', err);
     }
 }
 
@@ -623,58 +1390,220 @@ function initMailer() {
 }
 initMailer();
 
-// Helper to resolve country from client timezone
-function resolveCountry(timezone) {
-    if (!timezone) return { name: 'Kenya', flag: '🇰🇪' };
-    
-    const tz = timezone.toLowerCase();
-    if (tz.includes('nairobi')) return { name: 'Kenya', flag: '🇰🇪' };
-    if (tz.includes('kampala')) return { name: 'Uganda', flag: '🇺🇬' };
-    if (tz.includes('dar_es_salaam')) return { name: 'Tanzania', flag: '🇹🇿' };
-    if (tz.includes('kigali')) return { name: 'Rwanda', flag: '🇷🇼' };
-    if (tz.includes('london')) return { name: 'United Kingdom', flag: '🇬🇧' };
-    if (tz.includes('america/') || tz.includes('us/')) return { name: 'United States', flag: '🇺🇸' };
-    if (tz.includes('paris')) return { name: 'France', flag: '🇫🇷' };
-    if (tz.includes('berlin')) return { name: 'Germany', flag: '🇩🇪' };
-    if (tz.includes('tokyo')) return { name: 'Japan', flag: '🇯🇵' };
-    if (tz.includes('harare') || tz.includes('johannesburg') || tz.includes('cairo')) return { name: 'South Africa', flag: '🇿🇦' };
-    
-    return { name: 'Kenya', flag: '🇰🇪' }; // Default fallback
+// ==========================================
+// IMAP CLIENT & SYNC SETUP (Gmail Receiving)
+// ==========================================
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
+
+async function syncGmailEmails() {
+    const imapUser = process.env.IMAP_USER || 'geniusminds2425@gmail.com';
+    const imapPass = process.env.IMAP_PASS;
+
+    // Check if credentials are set
+    if (!imapUser || !imapPass) {
+        console.warn('⚠️ IMAP credentials not configured in .env. Falling back to mock emails.');
+        await generateMockEmails();
+        return;
+    }
+
+    const client = new ImapFlow({
+        host: process.env.IMAP_HOST || 'imap.gmail.com',
+        port: parseInt(process.env.IMAP_PORT || '993'),
+        secure: process.env.IMAP_SECURE !== 'false',
+        auth: {
+            user: imapUser,
+            pass: imapPass
+        },
+        logger: false
+    });
+
+    try {
+        await client.connect();
+
+        // Lock inbox to fetch messages
+        let lock = await client.getMailboxLock('INBOX');
+        try {
+            const status = await client.status('INBOX', { messages: true });
+            const totalMessages = status.messages;
+
+            if (totalMessages > 0) {
+                // Fetch last 20 messages to keep sync snappy
+                const startSeq = Math.max(1, totalMessages - 19);
+                const range = `${startSeq}:${totalMessages}`;
+
+                for await (let message of client.fetch(range, { source: true, envelope: true })) {
+                    const messageId = message.envelope.messageId;
+
+                    // Check if message already exists in DB
+                    const existing = await db.query('SELECT * FROM received_emails WHERE message_id = ?', [messageId]);
+                    if (existing.length === 0) {
+                        // Parse raw message source using simpleParser
+                        const parsed = await simpleParser(message.source);
+
+                        // Extract details
+                        const senderName = parsed.from && parsed.from.value && parsed.from.value[0] ? (parsed.from.value[0].name || '') : '';
+                        const senderEmail = parsed.from && parsed.from.value && parsed.from.value[0] ? (parsed.from.value[0].address || '') : '';
+                        const subject = parsed.subject || '(No Subject)';
+                        const body = parsed.html || parsed.text || '(No Content)';
+                        const receivedAt = parsed.date || new Date();
+
+                        // Save in database
+                        await db.query(
+                            'INSERT INTO received_emails (message_id, sender_name, sender_email, subject, body, received_at) VALUES (?, ?, ?, ?, ?, ?)',
+                            [messageId, senderName, senderEmail, subject, body, receivedAt]
+                        );
+                        console.log(`📥 Synced new email from ${senderEmail}: "${subject}"`);
+                    }
+                }
+            }
+        } finally {
+            lock.release();
+        }
+
+        await client.logout();
+    } catch (err) {
+        console.error('❌ IMAP sync failed:', err);
+        console.log('🔄 Falling back to generating mock emails.');
+        await generateMockEmails();
+    }
+}
+
+// Generate premium mock emails for demonstration/development
+async function generateMockEmails() {
+    const mockEmails = [
+        {
+            message_id: 'mock-msg-1@geniusminds.com',
+            sender_name: 'Sarah Wambui',
+            sender_email: 'sarah.wambui@gmail.com',
+            subject: 'Inquiry about Home-Based Tutoring Rates',
+            body: `<p>Dear Genius Minds Team,</p>
+                   <p>I would like to inquire about your home-based tutoring rates for a Grade 5 student. We reside in Kilimani, Nairobi. Do you have tutors available on weekday evenings (from 4:30 PM)?</p>
+                   <p>Please let me know the pricing structures and how we can get started.</p>
+                   <p>Best regards,<br>Sarah Wambui<br>+254 712 345 678</p>`,
+            received_at: new Date(Date.now() - 3600000 * 2) // 2 hours ago
+        },
+        {
+            message_id: 'mock-msg-2@geniusminds.com',
+            sender_name: 'David Kimani',
+            sender_email: 'david.kimani@outlook.com',
+            subject: 'Do you offer coding/STEM classes at the physical center?',
+            body: `<p>Hi Genius Minds,</p>
+                   <p>I was browsing your website and saw you have a physical center in Nairobi. My daughter is 12 years old and is very interested in learning computer coding (specifically Python) and STEM projects.</p>
+                   <p>Do you offer specialized coding or STEM tutoring at your center? If so, what are the weekend schedules and costs?</p>
+                   <p>Regards,<br>David Kimani</p>`,
+            received_at: new Date(Date.now() - 3600000 * 24) // 1 day ago
+        },
+        {
+            message_id: 'mock-msg-3@geniusminds.com',
+            sender_name: 'Amara Okafor',
+            sender_email: 'amara.okafor@gmail.com',
+            subject: 'Online tutoring classes inquiry for Grade 8 student',
+            body: `<p>Hello team,</p>
+                   <p>I am looking for an online tutor for my son who is preparing for his upcoming junior high math exam. He needs help particularly with algebra and geometry.</p>
+                   <p>Do you conduct classes via Zoom? Could you send details about scheduling a trial session?</p>
+                   <p>Thank you,<br>Amara</p>`,
+            received_at: new Date(Date.now() - 3600000 * 48) // 2 days ago
+        }
+    ];
+
+    for (const email of mockEmails) {
+        const existing = await db.query('SELECT * FROM received_emails WHERE message_id = ?', [email.message_id]);
+        if (existing.length === 0) {
+            await db.query(
+                'INSERT INTO received_emails (message_id, sender_name, sender_email, subject, body, received_at) VALUES (?, ?, ?, ?, ?, ?)',
+                [email.message_id, email.sender_name, email.sender_email, email.subject, email.body, email.received_at]
+            );
+        }
+    }
+}
+
+
+// Real IP Geolocation using ip-api.com (free, no API key needed)
+// Results are cached in memory to avoid redundant lookups
+const geoCache = {};
+
+async function resolveCountryFromIP(ip) {
+    // Skip private/local IPs
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+        return { name: 'Local / Dev', flag: '🖥️', city: 'Localhost', region: '' };
+    }
+    if (geoCache[ip]) return geoCache[ip];
+    try {
+        const https = require('https');
+        const result = await new Promise((resolve, reject) => {
+            const req = https.get(`https://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city`, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(data)); }
+                    catch (e) { reject(e); }
+                });
+            });
+            req.on('error', reject);
+            req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
+        });
+        if (result.status === 'success') {
+            const code = (result.countryCode || 'KE').toLowerCase();
+            // Build emoji flag from country code
+            const flag = result.countryCode
+                ? String.fromCodePoint(...[...result.countryCode.toUpperCase()].map(c => 0x1F1E6 - 65 + c.charCodeAt(0)))
+                : '🌍';
+
+            let locationName = result.country || 'Unknown';
+            // If the visitor is from Kenya, show the County/Region instead of just "Kenya"
+            if (result.countryCode === 'KE' && result.regionName) {
+                locationName = `${result.regionName}, Kenya`;
+            }
+
+            const geo = { name: locationName, flag, code, city: result.city || '', region: result.regionName || '' };
+            geoCache[ip] = geo;
+            return geo;
+        }
+    } catch (e) {
+        // Silent fallback
+    }
+    return { name: 'Unknown', flag: '🌍', code: 'xx', city: '', region: '' };
 }
 
 // Helper to parse User-Agent
 function parseUserAgent(uaString) {
     if (!uaString) return { browser: 'Unknown', os: 'Unknown', device: 'Unknown' };
-    
+
     let browser = 'Unknown';
     let os = 'Unknown';
     let device = 'Desktop';
-    
+
     // Parse OS
     if (uaString.includes('Windows')) os = 'Windows';
     else if (uaString.includes('Macintosh') || uaString.includes('Mac OS X')) os = 'macOS';
     else if (uaString.includes('Android')) { os = 'Android'; device = 'Mobile'; }
     else if (uaString.includes('iPhone') || uaString.includes('iPad')) { os = 'iOS'; device = 'Mobile'; }
     else if (uaString.includes('Linux')) os = 'Linux';
-    
+
     // Parse Browser
     if (uaString.includes('Firefox')) browser = 'Firefox';
     else if (uaString.includes('Chrome') && !uaString.includes('Chromium')) browser = 'Chrome';
     else if (uaString.includes('Safari') && !uaString.includes('Chrome')) browser = 'Safari';
     else if (uaString.includes('Edge')) browser = 'Edge';
     else if (uaString.includes('MSIE') || uaString.includes('Trident')) browser = 'Internet Explorer';
-    
+
     // Parse Device Type
     if (uaString.includes('Mobile') || uaString.includes('Tablet') || uaString.includes('iPad') || uaString.includes('iPhone') || uaString.includes('Android')) {
         device = uaString.includes('Tablet') || uaString.includes('iPad') ? 'Tablet' : 'Mobile';
     }
-    
+
     return { browser, os, device };
 }
 
 // Middleware: Check if logged in as Admin
 function requireAdmin(req, res, next) {
     if (req.session && req.session.isAdmin) {
+        // Update activity timestamp on every admin request
+        req.session.lastActivity = Date.now();
+        req.session.save((err) => {
+            if (err) console.error('Session save error:', err);
+        });
         next();
     } else {
         res.status(401).json({ error: 'Unauthorized. Admin access required.' });
@@ -688,19 +1617,24 @@ function requireAdmin(req, res, next) {
 // 1. Submit Booking Request
 app.post('/api/bookings', async (req, res) => {
     const { name, email, phone, service, message } = req.body;
-    
+
     if (!name || !email || !phone || !service) {
         return res.status(400).json({ error: 'Missing required booking fields.' });
     }
-    
+
     try {
+        const crypto = require('crypto');
+        const trackingToken = 'bkg_' + crypto.randomBytes(6).toString('hex');
+
         // Insert into database
         const result = await db.query(
-            'INSERT INTO bookings (name, email, phone, service, message) VALUES (?, ?, ?, ?, ?)',
-            [name, email, phone, service, message || '']
+            'INSERT INTO bookings (name, email, phone, service, message, tracking_token) VALUES (?, ?, ?, ?, ?, ?)',
+            [name, email, phone, service, message || '', trackingToken]
         );
         const bookingId = result.insertId;
-        
+
+        const trackingLink = `http://${req.headers.host || 'localhost:3000'}/track.html?token=${trackingToken}`;
+
         // Prepare Email
         const recipient = process.env.NOTIFICATION_RECIPIENT || 'geniusminds2425@gmail.com';
         const subject = `New Booking Request from ${name}`;
@@ -711,13 +1645,14 @@ app.post('/api/bookings', async (req, res) => {
             <p><strong>Phone Number:</strong> ${phone}</p>
             <p><strong>Preferred Learning Option:</strong> ${service}</p>
             <p><strong>Additional Notes:</strong> ${message || 'None'}</p>
+            <p><strong>Tracking Link:</strong> <a href="${trackingLink}">${trackingLink}</a></p>
             <hr>
             <p>This message was sent from your Genius Minds Homeschooling website contact form.</p>
         `;
-        
+
         let mailStatus = 'sent';
         let mailError = null;
-        
+
         if (transporter) {
             try {
                 await transporter.sendMail({
@@ -741,13 +1676,32 @@ app.post('/api/bookings', async (req, res) => {
             console.log('-------------------------------------------');
             mailStatus = 'logged_to_console';
         }
-        
+
         // Log the email action
         await db.query(
             'INSERT INTO email_logs (booking_id, recipient, subject, body, status, error_message) VALUES (?, ?, ?, ?, ?, ?)',
             [bookingId, recipient, subject, emailBody, mailStatus, mailError]
         );
-        
+
+        // --- WhatsApp Notifications ---
+        // Get WhatsApp admin phone from site settings (with .env fallback for backwards compatibility)
+        let adminPhone = null;
+        try {
+            const settings = await db.query('SELECT setting_value FROM site_settings WHERE setting_key = ?', ['whatsapp_phone']);
+            adminPhone = settings.length > 0 ? settings[0].setting_value : null;
+        } catch (err) {
+            console.error('Error fetching WhatsApp phone from settings:', err);
+        }
+        adminPhone = adminPhone || process.env.WHATSAPP_ADMIN_PHONE || '0140802797';
+
+        // Notify Admin
+        const adminMsg = `🆕 *New Booking Request*\n\n*Name:* ${name}\n*Phone:* ${phone}\n*Service:* ${service}\n\n*Message:* ${message || 'None'}`;
+        whatsappService.sendMessage(adminPhone, adminMsg);
+
+        // Notify Customer
+        const customerMsg = `Hello ${name}, 👋\n\nWe have received your booking request for *${service}* at Genius Minds Homeschooling.\n\nYou can track the status of your booking and chat with us directly using your secure tracking link:\n${trackingLink}\n\nThank you for choosing us! 🎓`;
+        whatsappService.sendMessage(phone, customerMsg);
+
         res.json({ success: true, bookingId });
     } catch (err) {
         console.error('Error creating booking request:', err);
@@ -755,20 +1709,124 @@ app.post('/api/bookings', async (req, res) => {
     }
 });
 
-// 2. Analytics Session Registration
+// ==========================================
+// TRACKING PORTAL APIS
+// ==========================================
+
+// Get Booking by Token
+app.get('/api/booking/track/:token', async (req, res) => {
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE tracking_token = ?', [req.params.token]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Invalid or expired tracking token.' });
+
+        const booking = bookings[0];
+        const messages = await db.query('SELECT * FROM booking_messages WHERE booking_id = ? ORDER BY created_at ASC', [booking.id]);
+
+        res.json({ booking, messages });
+    } catch (err) {
+        console.error('Error fetching tracking info:', err);
+        res.status(500).json({ error: 'Failed to fetch booking details.' });
+    }
+});
+
+// Send Message from Customer (supports file attachments)
+app.post('/api/booking/track/:token/message', upload.single('attachment'), async (req, res) => {
+    const message = (req.body.message || '').trim();
+    const hasAttachment = !!req.file;
+
+    if (!message && !hasAttachment) {
+        return res.status(400).json({ error: 'A message or attachment is required.' });
+    }
+
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE tracking_token = ?', [req.params.token]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Invalid tracking token.' });
+
+        const booking = bookings[0];
+        const attachmentUrl = hasAttachment ? `/uploads/${req.file.filename}` : null;
+        const attachmentName = hasAttachment ? req.file.originalname : null;
+        const displayMsg = message || (hasAttachment ? `[Attached: ${req.file.originalname}]` : '');
+
+        await db.query(
+            'INSERT INTO booking_messages (booking_id, sender, message, attachment_url, attachment_name) VALUES (?, ?, ?, ?, ?)',
+            [booking.id, 'customer', displayMsg, attachmentUrl, attachmentName]
+        );
+
+        // Notify Admin
+        const adminPhone = process.env.WHATSAPP_ADMIN_PHONE || '0140802797';
+        const attachNote = hasAttachment ? `\n📎 Attachment: ${req.file.originalname}` : '';
+        const adminMsg = `💬 *New Message from Customer*\n\n*Name:* ${booking.name}\n*Message:* ${displayMsg}${attachNote}`;
+        whatsappService.sendMessage(adminPhone, adminMsg);
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error sending customer message:', err);
+        res.status(500).json({ error: 'Failed to send message.' });
+    }
+});
+
+// Admin APIs for Messages
+app.get('/api/admin/bookings/:id/messages', requireAdmin, async (req, res) => {
+    try {
+        const messages = await db.query('SELECT * FROM booking_messages WHERE booking_id = ? ORDER BY created_at ASC', [req.params.id]);
+        res.json(messages);
+    } catch (err) {
+        console.error('Error fetching admin messages:', err);
+        res.status(500).json({ error: 'Failed to fetch messages.' });
+    }
+});
+
+app.post('/api/admin/bookings/:id/messages', requireAdmin, upload.single('attachment'), async (req, res) => {
+    const message = (req.body.message || '').trim();
+    const hasAttachment = !!req.file;
+
+    if (!message && !hasAttachment) {
+        return res.status(400).json({ error: 'A message or attachment is required.' });
+    }
+
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE id = ?', [req.params.id]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Booking not found.' });
+
+        const booking = bookings[0];
+        const attachmentUrl = hasAttachment ? `/uploads/${req.file.filename}` : null;
+        const attachmentName = hasAttachment ? req.file.originalname : null;
+        const displayMsg = message || (hasAttachment ? `[Attached: ${req.file.originalname}]` : '');
+
+        await db.query(
+            'INSERT INTO booking_messages (booking_id, sender, message, attachment_url, attachment_name) VALUES (?, ?, ?, ?, ?)',
+            [booking.id, 'admin', displayMsg, attachmentUrl, attachmentName]
+        );
+
+        // Notify Customer via WhatsApp
+        const trackingLink = `http://${req.headers.host || 'localhost:3000'}/track.html?token=${booking.tracking_token}`;
+        const attachNote = hasAttachment ? `\n📎 Attachment: ${req.file.originalname}` : '';
+        const customerMsg = `Hello ${booking.name}, you have a new message from Genius Minds regarding your booking!\n\n*Admin:* ${displayMsg}${attachNote}\n\nReply here: ${trackingLink}`;
+        whatsappService.sendMessage(booking.phone, customerMsg);
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error sending admin reply:', err);
+        res.status(500).json({ error: 'Failed to send reply.' });
+    }
+});
+
+// 2. Analytics Session Registration (with real IP geolocation)
 app.post('/api/analytics/session', async (req, res) => {
-    const { sessionKey, referrer, timezone } = req.body;
+    const { sessionKey, referrer } = req.body;
     if (!sessionKey) return res.status(400).json({ error: 'Session key is required.' });
-    
+
     const uaString = req.headers['user-agent'] || '';
-    const ip = req.ip || req.headers['x-forwarded-for'] || '127.0.0.1';
+    const rawIp = (req.headers['x-forwarded-for'] || req.ip || '127.0.0.1').split(',')[0].trim();
     const parsedUa = parseUserAgent(uaString);
-    const country = resolveCountry(timezone);
-    
+
+    // Resolve real country from IP address
+    const geo = await resolveCountryFromIP(rawIp);
+
     try {
         await db.query(
             'INSERT INTO analytics_sessions (session_key, ip_address, user_agent, browser, os, device, referrer, country_name, country_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP',
-            [sessionKey, ip, uaString, parsedUa.browser, parsedUa.os, parsedUa.device, referrer || '', country.name, country.flag]
+            [sessionKey, rawIp, uaString, parsedUa.browser, parsedUa.os, parsedUa.device, referrer || '', geo.name, geo.flag]
         );
         res.json({ success: true });
     } catch (err) {
@@ -783,7 +1841,7 @@ app.post('/api/analytics/event', async (req, res) => {
     if (!sessionKey || !eventType || !eventName) {
         return res.status(400).json({ error: 'Missing analytics fields.' });
     }
-    
+
     try {
         await db.query(
             'INSERT INTO analytics_events (session_key, event_type, event_name, event_data) VALUES (?, ?, ?, ?)',
@@ -807,21 +1865,22 @@ app.post('/api/admin/login', async (req, res) => {
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required.' });
     }
-    
+
     try {
         const users = await db.query('SELECT * FROM admin_users WHERE username = ?', [username]);
         if (users.length === 0) {
             return res.status(401).json({ error: 'Invalid credentials.' });
         }
-        
+
         const user = users[0];
         const match = await bcrypt.compare(password, user.password_hash);
         if (!match) {
             return res.status(401).json({ error: 'Invalid credentials.' });
         }
-        
+
         req.session.isAdmin = true;
         req.session.username = username;
+        req.session.lastActivity = Date.now(); // Initialize lastActivity on login
         res.json({ success: true });
     } catch (err) {
         console.error('Admin login error:', err);
@@ -852,25 +1911,36 @@ app.get('/api/admin/check-session', (req, res) => {
 // ADMIN DASHBOARD APIS (Auth Required)
 // ==========================================
 
-// Get Analytics & Dashboard Statistics (Google Analytics Style)
+// Get Analytics & Dashboard Statistics with optional date range filtering
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+    // Date range filtering: default to last 30 days
+    const now = new Date();
+    const defaultStart = new Date(now); defaultStart.setDate(now.getDate() - 30);
+    const startDate = req.query.startDate ? new Date(req.query.startDate) : defaultStart;
+    const endDate = req.query.endDate ? new Date(req.query.endDate + 'T23:59:59') : now;
+
     try {
-        const bookings = await db.query('SELECT * FROM bookings ORDER BY created_at DESC');
-        const sessions = await db.query('SELECT * FROM analytics_sessions ORDER BY created_at DESC');
-        const events = await db.query('SELECT * FROM analytics_events ORDER BY created_at DESC');
-        
+        const allBookings = await db.query('SELECT * FROM bookings ORDER BY created_at DESC');
+        const allSessions = await db.query('SELECT * FROM analytics_sessions ORDER BY created_at DESC');
+        const allEvents = await db.query('SELECT * FROM analytics_events ORDER BY created_at DESC');
+
+        // Filter by date range
+        const bookings = allBookings.filter(b => { const d = new Date(b.created_at); return d >= startDate && d <= endDate; });
+        const sessions = allSessions.filter(s => { const d = new Date(s.created_at); return d >= startDate && d <= endDate; });
+        const events = allEvents.filter(e => { const d = new Date(e.created_at); return d >= startDate && d <= endDate; });
+
         // 1. Basic Counts
         const totalBookings = bookings.length;
         const totalPageviews = events.filter(e => e.event_type === 'pageview').length;
         const totalSessions = sessions.length;
-        
+
         // 2. Real-Time Active Users (last 5 minutes)
         const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
         const activeUsers = sessions.filter(s => new Date(s.updated_at) > fiveMinsAgo).length;
-        
+
         // 3. Conversion Rate
         const conversionRate = totalSessions > 0 ? ((totalBookings / totalSessions) * 100).toFixed(1) : 0;
-        
+
         // 4. Bounce Rate (Sessions with only 1 event)
         const sessionEventCounts = {};
         events.forEach(e => {
@@ -884,7 +1954,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
             }
         });
         const bounceRate = totalSessions > 0 ? ((bouncedSessions / totalSessions) * 100).toFixed(1) : 0;
-        
+
         // 5. Avg Session Duration
         const sessionTimes = {};
         events.forEach(e => {
@@ -906,25 +1976,25 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
             }
         });
         const avgDurationSeconds = sessionsWithDuration > 0 ? Math.round((totalDurationMs / sessionsWithDuration) / 1000) : 0;
-        
+
         // Format duration to MM:SS
         const mins = Math.floor(avgDurationSeconds / 60);
         const remainingSecs = avgDurationSeconds % 60;
         const avgDurationFormatted = `${mins}m ${remainingSecs}s`;
-        
+
         // 6. Services Distribution
         const services = {};
         bookings.forEach(b => {
             services[b.service] = (services[b.service] || 0) + 1;
         });
-        
+
         // 7. Devices & Browsers Breakdown
         const devices = {};
         sessions.forEach(s => {
             const dev = s.device || 'Unknown';
             devices[dev] = (devices[dev] || 0) + 1;
         });
-        
+
         const browsers = {};
         sessions.forEach(s => {
             const br = s.browser || 'Unknown';
@@ -942,7 +2012,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         sessions.forEach(s => {
             const cName = s.country_name || 'Kenya';
             const cFlag = s.country_flag || '🇰🇪';
-            
+
             // Map name to 2-letter country code for FlagCDN
             let code = 'ke';
             const nameLower = cName.toLowerCase();
@@ -955,35 +2025,57 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
             else if (nameLower.includes('germany')) code = 'de';
             else if (nameLower.includes('japan')) code = 'jp';
             else if (nameLower.includes('south africa')) code = 'za';
-            
+
             if (!countries[cName]) {
                 countries[cName] = { name: cName, flag: cFlag, code: code, count: 0 };
             }
             countries[cName].count++;
         });
-        
-        // 8. Timeline (Recent 7 days)
+
+        // 8. Top Pages breakdown from pageview events
+        const pagesMap = {};
+        const pageVisitors = {};
+        events.filter(e => e.event_type === 'pageview').forEach(e => {
+            let pageLabel = 'Home';
+            try {
+                const data = typeof e.event_data === 'string' ? JSON.parse(e.event_data) : e.event_data;
+                if (data && data.page) pageLabel = data.page;
+                else if (data && data.url) {
+                    const url = data.url.toLowerCase();
+                    if (url.includes('about')) pageLabel = 'About';
+                    else if (url.includes('contact')) pageLabel = 'Contact';
+                    else if (url.includes('blog-post')) pageLabel = 'Blog Post';
+                    else if (url.includes('blog')) pageLabel = 'Blog';
+                    else if (url.includes('courses')) pageLabel = 'Courses';
+                    else if (url.includes('faq')) pageLabel = 'FAQ';
+                }
+            } catch (_) { }
+            pagesMap[pageLabel] = (pagesMap[pageLabel] || 0) + 1;
+            if (!pageVisitors[pageLabel]) pageVisitors[pageLabel] = new Set();
+            pageVisitors[pageLabel].add(e.session_key);
+        });
+        const topPages = Object.keys(pagesMap)
+            .map(page => ({ page, views: pagesMap[page], visitors: pageVisitors[page].size }))
+            .sort((a, b) => b.views - a.views);
+
+        // 9. Timeline grouped by day within date range
         const timeline = {};
-        for (let i = 6; i >= 0; i--) {
-            const d = new Date();
+        const rangeDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
+        const maxDays = Math.min(rangeDays, 90); // cap display to 90 days
+        for (let i = maxDays - 1; i >= 0; i--) {
+            const d = new Date(endDate);
             d.setDate(d.getDate() - i);
             const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
             timeline[dateStr] = { pageviews: 0, sessions: 0 };
         }
-        
         sessions.forEach(s => {
             const dateStr = new Date(s.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            if (timeline[dateStr]) {
-                timeline[dateStr].sessions++;
-            }
+            if (timeline[dateStr]) timeline[dateStr].sessions++;
         });
-        
         events.forEach(e => {
             if (e.event_type === 'pageview') {
                 const dateStr = new Date(e.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                if (timeline[dateStr]) {
-                    timeline[dateStr].pageviews++;
-                }
+                if (timeline[dateStr]) timeline[dateStr].pageviews++;
             }
         });
 
@@ -1016,7 +2108,7 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
             total: eventSummary[k].total,
             visitors: eventSummary[k].visitors.size
         })).sort((a, b) => b.total - a.total).slice(0, 10);
-        
+
         res.json({
             dbMode,
             stats: {
@@ -1031,6 +2123,11 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
             timeline,
             topReferrers,
             eventsGA,
+            topPages,
+            dateRange: {
+                startDate: isNaN(startDate.getTime()) ? null : startDate.toISOString(),
+                endDate: isNaN(endDate.getTime()) ? null : endDate.toISOString()
+            },
             breakdowns: {
                 services,
                 devices,
@@ -1045,277 +2142,126 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
     }
 });
 
-// Ensure uploads folder exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Multer upload setup using memory storage
-const upload = multer({ storage: multer.memoryStorage() });
-
 // ==========================================
-// HIGHLIGHTS BANNER APIS
+// DEDICATED ANALYTICS ENDPOINTS
 // ==========================================
 
-// 1. Get Public Highlights Banners (Filtered by visibility and scheduled times)
-app.get('/api/banners', async (req, res) => {
+// Timeline: Grouped visits by day/week/month with date range
+app.get('/api/admin/analytics/timeline', requireAdmin, async (req, res) => {
     try {
-        const banners = await db.query('SELECT * FROM highlights_banners');
         const now = new Date();
-        const activeBanners = banners
-            .filter(b => {
-                // Check active status (default to 1 if not set)
-                const isActive = b.is_active === undefined || b.is_active == 1;
-                // Check start date (if set, now must be >= start_date)
-                const hasStarted = !b.start_date || now >= new Date(b.start_date);
-                // Check end date (if set, now must be <= end_date)
-                const hasEnded = !b.end_date || now <= new Date(b.end_date);
-                
-                return isActive && hasStarted && hasEnded;
-            })
-            .sort((a, b) => a.sort_order - b.sort_order);
-            
-        res.json(activeBanners);
-    } catch (err) {
-        console.error('Error fetching highlights banners:', err);
-        res.status(500).json({ error: 'Failed to retrieve banners.' });
-    }
-});
+        const defaultStart = new Date(now); defaultStart.setDate(now.getDate() - 30);
+        const startDate = req.query.startDate ? new Date(req.query.startDate) : defaultStart;
+        const endDate = req.query.endDate ? new Date(req.query.endDate + 'T23:59:59') : now;
+        const groupBy = req.query.groupBy || 'day'; // 'day', 'week', 'month'
 
-// 2. Get Admin Banners
-app.get('/api/admin/banners', requireAdmin, async (req, res) => {
-    try {
-        const banners = await db.query('SELECT * FROM highlights_banners ORDER BY sort_order ASC');
-        res.json(banners);
-    } catch (err) {
-        console.error('Error fetching admin highlights banners:', err);
-        res.status(500).json({ error: 'Failed to retrieve banners.' });
-    }
-});
+        const sessions = await db.query('SELECT * FROM analytics_sessions ORDER BY created_at DESC');
+        const events = await db.query('SELECT * FROM analytics_events ORDER BY created_at DESC');
 
-// 3. Create Highlights Banner
-app.post('/api/admin/banners', requireAdmin, upload.single('image'), async (req, res) => {
-    try {
-        const {
-            badge_text,
-            badge_class,
-            title,
-            subtitle,
-            btn_primary_text,
-            btn_primary_link,
-            btn_secondary_text,
-            btn_secondary_link,
-            stat_1_number,
-            stat_1_label,
-            stat_2_number,
-            stat_2_label,
-            stat_3_number,
-            stat_3_label,
-            floating_icon,
-            floating_title,
-            floating_desc,
-            glow_class,
-            sort_order,
-            is_active,
-            start_date,
-            end_date
-        } = req.body;
+        const filteredSessions = sessions.filter(s => { const d = new Date(s.created_at); return d >= startDate && d <= endDate; });
+        const filteredEvents = events.filter(e => { const d = new Date(e.created_at); return d >= startDate && d <= endDate; });
 
-        if (!badge_text || !badge_class || !title || !subtitle || !glow_class) {
-            return res.status(400).json({ error: 'Missing required banner text fields.' });
-        }
-
-        if (!req.file) {
-            return res.status(400).json({ error: 'Banner image is required.' });
-        }
-
-        // Process image using sharp: crop/resize to 800x800 cover fit, compress to WebP
-        const filename = `banner_${Date.now()}.webp`;
-        const filepath = path.join(uploadsDir, filename);
-
-        await sharp(req.file.buffer)
-            .resize(800, 800, {
-                fit: 'cover',
-                position: 'center'
-            })
-            .webp({ quality: 85 })
-            .toFile(filepath);
-
-        const image_path = `uploads/${filename}`;
-
-        // Insert into database
-        await db.query(`
-            INSERT INTO highlights_banners (
-                badge_text, badge_class, title, subtitle,
-                btn_primary_text, btn_primary_link, btn_secondary_text, btn_secondary_link,
-                stat_1_number, stat_1_label, stat_2_number, stat_2_label, stat_3_number, stat_3_label,
-                image_path, floating_icon, floating_title, floating_desc, glow_class, sort_order,
-                is_active, start_date, end_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            badge_text, badge_class, title, subtitle,
-            btn_primary_text || '', btn_primary_link || '', btn_secondary_text || '', btn_secondary_link || '',
-            stat_1_number || '', stat_1_label || '', stat_2_number || '', stat_2_label || '', stat_3_number || '', stat_3_label || '',
-            image_path, floating_icon || '', floating_title || '', floating_desc || '', glow_class, parseInt(sort_order) || 0,
-            is_active !== undefined ? parseInt(is_active) : 1,
-            start_date ? new Date(start_date) : null,
-            end_date ? new Date(end_date) : null
-        ]);
-
-        res.json({ success: true, image_path });
-    } catch (err) {
-        console.error('Error creating banner:', err);
-        res.status(500).json({ error: 'Failed to create banner: ' + err.message });
-    }
-});
-
-// 4. Update Highlights Banner
-app.put('/api/admin/banners/:id', requireAdmin, upload.single('image'), async (req, res) => {
-    const bannerId = req.params.id;
-    try {
-        // Find existing banner
-        const banners = await db.query('SELECT * FROM highlights_banners');
-        const existingBanner = banners.find(b => b.id == bannerId);
-        
-        if (!existingBanner) {
-            return res.status(404).json({ error: 'Banner not found.' });
-        }
-
-        const {
-            badge_text,
-            badge_class,
-            title,
-            subtitle,
-            btn_primary_text,
-            btn_primary_link,
-            btn_secondary_text,
-            btn_secondary_link,
-            stat_1_number,
-            stat_1_label,
-            stat_2_number,
-            stat_2_label,
-            stat_3_number,
-            stat_3_label,
-            floating_icon,
-            floating_title,
-            floating_desc,
-            glow_class,
-            sort_order,
-            is_active,
-            start_date,
-            end_date
-        } = req.body;
-
-        if (!badge_text || !badge_class || !title || !subtitle || !glow_class) {
-            return res.status(400).json({ error: 'Missing required banner text fields.' });
-        }
-
-        let image_path = existingBanner.image_path;
-
-        // If new file is uploaded
-        if (req.file) {
-            // Process and save new image
-            const filename = `banner_${Date.now()}.webp`;
-            const filepath = path.join(uploadsDir, filename);
-
-            await sharp(req.file.buffer)
-                .resize(800, 800, {
-                    fit: 'cover',
-                    position: 'center'
-                })
-                .webp({ quality: 85 })
-                .toFile(filepath);
-
-            image_path = `uploads/${filename}`;
-
-            // Delete old image file if it's in the uploads directory
-            if (existingBanner.image_path.startsWith('uploads/')) {
-                const oldFilepath = path.join(__dirname, existingBanner.image_path);
-                if (fs.existsSync(oldFilepath)) {
-                    fs.unlinkSync(oldFilepath);
-                }
+        function getGroupKey(date) {
+            const d = new Date(date);
+            if (groupBy === 'month') return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short' });
+            if (groupBy === 'week') {
+                const weekStart = new Date(d);
+                weekStart.setDate(d.getDate() - d.getDay());
+                return weekStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
             }
+            return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
         }
 
-        // Run query to update
-        await db.query(`
-            UPDATE highlights_banners SET
-                badge_text = ?, badge_class = ?, title = ?, subtitle = ?,
-                btn_primary_text = ?, btn_primary_link = ?, btn_secondary_text = ?, btn_secondary_link = ?,
-                stat_1_number = ?, stat_1_label = ?, stat_2_number = ?, stat_2_label = ?, stat_3_number = ?, stat_3_label = ?,
-                image_path = ?, floating_icon = ?, floating_title = ?, floating_desc = ?, glow_class = ?, sort_order = ?,
-                is_active = ?, start_date = ?, end_date = ?
-            WHERE id = ?
-        `, [
-            badge_text, badge_class, title, subtitle,
-            btn_primary_text || '', btn_primary_link || '', btn_secondary_text || '', btn_secondary_link || '',
-            stat_1_number || '', stat_1_label || '', stat_2_number || '', stat_2_label || '', stat_3_number || '', stat_3_label || '',
-            image_path, floating_icon || '', floating_title || '', floating_desc || '', glow_class, parseInt(sort_order) || 0,
-            is_active !== undefined ? parseInt(is_active) : 1,
-            start_date ? new Date(start_date) : null,
-            end_date ? new Date(end_date) : null,
-            bannerId
-        ]);
+        const timeline = {};
+        filteredSessions.forEach(s => {
+            const key = getGroupKey(s.created_at);
+            if (!timeline[key]) timeline[key] = { label: key, sessions: 0, pageviews: 0 };
+            timeline[key].sessions++;
+        });
+        filteredEvents.filter(e => e.event_type === 'pageview').forEach(e => {
+            const key = getGroupKey(e.created_at);
+            if (!timeline[key]) timeline[key] = { label: key, sessions: 0, pageviews: 0 };
+            timeline[key].pageviews++;
+        });
 
-        res.json({ success: true, image_path });
+        res.json({
+            timeline: Object.values(timeline),
+            groupBy,
+            startDate: isNaN(startDate.getTime()) ? null : startDate.toISOString(),
+            endDate: isNaN(endDate.getTime()) ? null : endDate.toISOString()
+        });
     } catch (err) {
-        console.error('Error updating banner:', err);
-        res.status(500).json({ error: 'Failed to update banner: ' + err.message });
+        console.error('Error in analytics timeline:', err);
+        res.status(500).json({ error: 'Failed to fetch timeline.' });
     }
 });
 
-// 5. Delete Highlights Banner
-app.delete('/api/admin/banners/:id', requireAdmin, async (req, res) => {
-    const bannerId = req.params.id;
+// Top Pages: Ranked list with visits and unique visitors
+app.get('/api/admin/analytics/pages', requireAdmin, async (req, res) => {
     try {
-        const banners = await db.query('SELECT * FROM highlights_banners');
-        const existingBanner = banners.find(b => b.id == bannerId);
-        
-        if (!existingBanner) {
-            return res.status(404).json({ error: 'Banner not found.' });
-        }
+        const now = new Date();
+        const defaultStart = new Date(now); defaultStart.setDate(now.getDate() - 30);
+        const startDate = req.query.startDate ? new Date(req.query.startDate) : defaultStart;
+        const endDate = req.query.endDate ? new Date(req.query.endDate + 'T23:59:59') : now;
 
-        // Delete image file if it's in the uploads directory
-        if (existingBanner.image_path.startsWith('uploads/')) {
-            const oldFilepath = path.join(__dirname, existingBanner.image_path);
-            if (fs.existsSync(oldFilepath)) {
-                fs.unlinkSync(oldFilepath);
-            }
-        }
+        const events = await db.query('SELECT * FROM analytics_events ORDER BY created_at DESC');
+        const filtered = events.filter(e => {
+            const d = new Date(e.created_at);
+            return e.event_type === 'pageview' && d >= startDate && d <= endDate;
+        });
 
-        // Delete from database
-        await db.query('DELETE FROM highlights_banners WHERE id = ?', [bannerId]);
+        const pagesMap = {};
+        const pageVisitors = {};
+        filtered.forEach(e => {
+            let pageLabel = 'Home';
+            try {
+                const data = typeof e.event_data === 'string' ? JSON.parse(e.event_data) : e.event_data;
+                if (data && data.page) pageLabel = data.page;
+            } catch (_) { }
+            pagesMap[pageLabel] = (pagesMap[pageLabel] || 0) + 1;
+            if (!pageVisitors[pageLabel]) pageVisitors[pageLabel] = new Set();
+            pageVisitors[pageLabel].add(e.session_key);
+        });
 
-        res.json({ success: true });
+        const pages = Object.keys(pagesMap)
+            .map(page => ({ page, views: pagesMap[page], visitors: pageVisitors[page].size }))
+            .sort((a, b) => b.views - a.views);
+
+        res.json({ pages, total: filtered.length });
     } catch (err) {
-        console.error('Error deleting banner:', err);
-        res.status(500).json({ error: 'Failed to delete banner.' });
+        console.error('Error in analytics pages:', err);
+        res.status(500).json({ error: 'Failed to fetch page stats.' });
     }
 });
 
-// 6. Toggle Banner Visibility (Show/Hide) — quick action without full form submit
-app.patch('/api/admin/banners/:id/toggle', requireAdmin, async (req, res) => {
-    const bannerId = req.params.id;
+// Countries: Ranked with counts and percentages
+app.get('/api/admin/analytics/countries', requireAdmin, async (req, res) => {
     try {
-        const banners = await db.query('SELECT * FROM highlights_banners');
-        const existingBanner = banners.find(b => b.id == bannerId);
+        const now = new Date();
+        const defaultStart = new Date(now); defaultStart.setDate(now.getDate() - 30);
+        const startDate = req.query.startDate ? new Date(req.query.startDate) : defaultStart;
+        const endDate = req.query.endDate ? new Date(req.query.endDate + 'T23:59:59') : now;
 
-        if (!existingBanner) {
-            return res.status(404).json({ error: 'Banner not found.' });
-        }
+        const sessions = await db.query('SELECT * FROM analytics_sessions ORDER BY created_at DESC');
+        const filtered = sessions.filter(s => { const d = new Date(s.created_at); return d >= startDate && d <= endDate; });
 
-        const newStatus = existingBanner.is_active == 1 ? 0 : 1;
+        const countryMap = {};
+        filtered.forEach(s => {
+            const name = s.country_name || 'Unknown';
+            const flag = s.country_flag || '🌍';
+            if (!countryMap[name]) countryMap[name] = { name, flag, count: 0 };
+            countryMap[name].count++;
+        });
 
-        await db.query(
-            'UPDATE highlights_banners SET is_active = ? WHERE id = ?',
-            [newStatus, bannerId]
-        );
+        const total = filtered.length;
+        const countries = Object.values(countryMap)
+            .sort((a, b) => b.count - a.count)
+            .map(c => ({ ...c, percentage: total > 0 ? ((c.count / total) * 100).toFixed(1) : '0.0' }));
 
-        res.json({ success: true, is_active: newStatus });
+        res.json({ countries, total });
     } catch (err) {
-        console.error('Error toggling banner visibility:', err);
-        res.status(500).json({ error: 'Failed to toggle banner visibility.' });
+        console.error('Error in analytics countries:', err);
+        res.status(500).json({ error: 'Failed to fetch country stats.' });
     }
 });
 
@@ -1335,13 +2281,13 @@ app.post('/api/admin/users', requireAdmin, async (req, res) => {
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required.' });
     }
-    
+
     try {
         const existing = await db.query('SELECT * FROM admin_users WHERE username = ?', [username]);
         if (existing.length > 0) {
             return res.status(400).json({ error: 'Username already exists.' });
         }
-        
+
         const passwordHash = await bcrypt.hash(password, 10);
         await db.query('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)', [
             username,
@@ -1369,15 +2315,314 @@ app.get('/api/admin/bookings', requireAdmin, async (req, res) => {
 app.patch('/api/admin/bookings/:id', requireAdmin, async (req, res) => {
     const bookingId = req.params.id;
     const { status } = req.body;
-    
+
     if (!status) return res.status(400).json({ error: 'Status is required.' });
-    
+
     try {
         await db.query('UPDATE bookings SET status = ? WHERE id = ?', [status, bookingId]);
+
+        // Fetch booking to get phone number and name for WhatsApp notification
+        const bookings = await db.query('SELECT * FROM bookings WHERE id = ?', [bookingId]);
+        if (bookings.length > 0) {
+            const booking = bookings[0];
+            const msg = `Hello ${booking.name}, 👋\n\nYour booking request for *${booking.service}* has been updated to: *${status.toUpperCase()}*.\n\nThank you! 🎓`;
+            whatsappService.sendMessage(booking.phone, msg);
+        }
+
         res.json({ success: true });
     } catch (err) {
         console.error('Error updating booking status:', err);
         res.status(500).json({ error: 'Failed to update booking.' });
+    }
+});
+
+// ==========================================
+// WHATSAPP INTEGRATION & BOOKING CHAT
+// ==========================================
+
+// Get WhatsApp Status
+app.get('/api/admin/whatsapp/status', requireAdmin, async (req, res) => {
+    try {
+        const status = whatsappService.getStatus();
+
+        // If WhatsApp just became ready and has a phone number, auto-sync it (ONLY ONCE)
+        // Check if we've already saved this phone to avoid repeated saves
+        if (status.status === 'ready' && status.phoneNumber) {
+            try {
+                // Get the current saved phone
+                const existingSettings = await db.query('SELECT setting_value FROM site_settings WHERE setting_key = ?', ['whatsapp_phone']);
+                const savedPhone = existingSettings.length > 0 ? existingSettings[0].setting_value : null;
+
+                // Only save if it's different (prevents repeated saves)
+                if (savedPhone !== status.phoneNumber) {
+                    console.log(`🔄 WhatsApp phone changed: ${savedPhone} → ${status.phoneNumber}. Syncing...`);
+
+                    const phoneNumber = status.phoneNumber;
+                    if (dbMode === 'memory') {
+                        const existing = memDb.site_settings.find(s => s.setting_key === 'whatsapp_phone');
+                        if (existing) {
+                            existing.setting_value = phoneNumber;
+                        } else {
+                            memDb.site_settings.push({ setting_key: 'whatsapp_phone', setting_value: phoneNumber });
+                        }
+                    } else if (dbMode === 'mysql') {
+                        await dbPool.query(
+                            'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?',
+                            ['whatsapp_phone', phoneNumber, phoneNumber]
+                        );
+                    } else if (dbMode === 'sqlite') {
+                        await dbConnection.run(
+                            'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET setting_value = ?',
+                            ['whatsapp_phone', phoneNumber, phoneNumber]
+                        );
+                    }
+                    console.log(`✅ Auto-saved WhatsApp phone to settings: ${phoneNumber}`);
+
+                    // Auto-sync to social media
+                    const whatsappUrl = `https://wa.me/${phoneNumber}?text=Hello%20Genius%20Minds`;
+                    const socialExisting = await db.query('SELECT * FROM social_media WHERE name = ?', ['WhatsApp']);
+
+                    if (socialExisting.length > 0) {
+                        await db.query('UPDATE social_media SET url = ? WHERE name = ?', [whatsappUrl, 'WhatsApp']);
+                    } else {
+                        const maxOrder = await db.query('SELECT MAX(display_order) as max_order FROM social_media');
+                        const nextOrder = (maxOrder[0]?.max_order || 0) + 1;
+                        await db.query(
+                            'INSERT INTO social_media (name, url, display_order) VALUES (?, ?, ?)',
+                            ['WhatsApp', whatsappUrl, nextOrder]
+                        );
+                    }
+                    console.log(`✅ Auto-created/updated WhatsApp social media link`);
+                } else {
+                    // Phone hasn't changed, skip update
+                    console.log(`ℹ️ WhatsApp phone unchanged: ${status.phoneNumber} (skipping update)`);
+                }
+            } catch (syncErr) {
+                console.error('Error syncing WhatsApp phone:', syncErr);
+            }
+        }
+
+        res.json(status);
+    } catch (err) {
+        console.error('Error getting WhatsApp status:', err);
+        res.status(500).json({ error: 'Failed to get WhatsApp status' });
+    }
+});
+
+// Disconnect WhatsApp
+app.post('/api/admin/whatsapp/disconnect', requireAdmin, async (req, res) => {
+    try {
+        await whatsappService.disconnect();
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error disconnecting WhatsApp:', err);
+        res.status(500).json({ error: 'Failed to disconnect WhatsApp.' });
+    }
+});
+
+// Retrieve Booking Messages (Chat)
+app.get('/api/admin/bookings/:id/messages', requireAdmin, async (req, res) => {
+    const bookingId = req.params.id;
+    try {
+        const messages = await db.query('SELECT * FROM booking_messages WHERE booking_id = ? ORDER BY created_at ASC', [bookingId]);
+        res.json(messages);
+    } catch (err) {
+        console.error('Error fetching booking messages:', err);
+        res.status(500).json({ error: 'Failed to fetch messages.' });
+    }
+});
+
+// Send Admin Message (Chat)
+app.post('/api/admin/bookings/:id/messages', requireAdmin, upload.single('attachment'), async (req, res) => {
+    const bookingId = req.params.id;
+    const { message } = req.body;
+    let attachmentUrl = null;
+    let attachmentName = null;
+
+    if (req.file) {
+        attachmentUrl = `/uploads/${req.file.filename}`;
+        attachmentName = req.file.originalname;
+    }
+
+    if (!message && !attachmentUrl) {
+        return res.status(400).json({ error: 'Message or attachment is required.' });
+    }
+
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE id = ?', [bookingId]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Booking not found.' });
+        const booking = bookings[0];
+
+        await db.query(`
+            INSERT INTO booking_messages (booking_id, sender, message, attachment_url, attachment_name) 
+            VALUES (?, ?, ?, ?, ?)`,
+            [bookingId, 'admin', message || '', attachmentUrl, attachmentName]
+        );
+
+        // Notify user via WhatsApp
+        let waMsg = `*Genius Minds Admin:*\n\n${message}`;
+        if (attachmentUrl) {
+            waMsg += `\n\n[Attached: ${attachmentName}]`;
+        }
+        if (booking.tracking_token) {
+            waMsg += `\n\nTrack your booking here: https://geniusminds.website/track.html?token=${booking.tracking_token}`;
+        }
+
+        whatsappService.sendMessage(booking.phone, waMsg);
+
+        res.status(201).json({ success: true });
+    } catch (err) {
+        console.error('Error saving admin message:', err);
+        res.status(500).json({ error: 'Failed to save message.' });
+    }
+});
+
+// ==========================================
+// PUBLIC BOOKING TRACKING (track.html)
+// ==========================================
+
+// Get Booking & Messages by Tracking Token
+app.get('/api/booking/track/:token', async (req, res) => {
+    const token = req.params.token;
+    if (!token) return res.status(400).json({ error: 'Tracking token is required.' });
+
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE tracking_token = ?', [token]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Booking not found.' });
+
+        const booking = bookings[0];
+        const messages = await db.query('SELECT * FROM booking_messages WHERE booking_id = ? ORDER BY created_at ASC', [booking.id]);
+
+        res.json({ booking, messages });
+    } catch (err) {
+        console.error('Error fetching tracking data:', err);
+        res.status(500).json({ error: 'Failed to load tracking data.' });
+    }
+});
+
+// Post Message from Customer via Tracking Portal
+app.post('/api/booking/track/:token/message', upload.single('attachment'), async (req, res) => {
+    const token = req.params.token;
+    const { message } = req.body;
+    let attachmentUrl = null;
+    let attachmentName = null;
+
+    if (req.file) {
+        attachmentUrl = `/uploads/${req.file.filename}`;
+        attachmentName = req.file.originalname;
+    }
+
+    if (!message && !attachmentUrl) {
+        return res.status(400).json({ error: 'Message or attachment is required.' });
+    }
+
+    try {
+        const bookings = await db.query('SELECT * FROM bookings WHERE tracking_token = ?', [token]);
+        if (bookings.length === 0) return res.status(404).json({ error: 'Booking not found.' });
+
+        const booking = bookings[0];
+
+        await db.query(`
+            INSERT INTO booking_messages (booking_id, sender, message, attachment_url, attachment_name) 
+            VALUES (?, ?, ?, ?, ?)`,
+            [booking.id, 'customer', message || '', attachmentUrl, attachmentName]
+        );
+
+        // Notify admin via WhatsApp (if admin's number was known, but we'll let it just appear in the portal)
+        // Or if the system sends an email to the admin:
+        // sendEmailNotificationToAdmin(`New message from ${booking.name} on booking #${booking.id}`, message);
+
+        res.status(201).json({ success: true });
+    } catch (err) {
+        console.error('Error saving customer message:', err);
+        res.status(500).json({ error: 'Failed to save message.' });
+    }
+});
+
+// Sync emails via IMAP
+app.get('/api/admin/emails/sync', requireAdmin, async (req, res) => {
+    try {
+        await syncGmailEmails();
+        const received = await db.query('SELECT * FROM received_emails ORDER BY received_at DESC');
+        res.json({ success: true, emails: received });
+    } catch (err) {
+        console.error('Error syncing emails:', err);
+        res.status(500).json({ error: 'Failed to sync emails from Gmail.' });
+    }
+});
+
+// Retrieve Received Inbox Emails
+app.get('/api/admin/emails/inbox', requireAdmin, async (req, res) => {
+    try {
+        const received = await db.query('SELECT * FROM received_emails ORDER BY received_at DESC');
+        res.json(received);
+    } catch (err) {
+        console.error('Error fetching inbox emails:', err);
+        res.status(500).json({ error: 'Failed to fetch inbox emails.' });
+    }
+});
+
+// Retrieve Outgoing/Sent Email Logs
+app.get('/api/admin/emails/sent', requireAdmin, async (req, res) => {
+    try {
+        const emails = await db.query('SELECT * FROM email_logs ORDER BY created_at DESC');
+        res.json(emails);
+    } catch (err) {
+        console.error('Error fetching sent email logs:', err);
+        res.status(500).json({ error: 'Failed to fetch sent email logs.' });
+    }
+});
+
+// Send Manual Email from Dashboard
+app.post('/api/admin/emails/send', requireAdmin, async (req, res) => {
+    const { recipient, subject, body } = req.body;
+
+    if (!recipient || !subject || !body) {
+        return res.status(400).json({ error: 'Recipient, subject, and body are required.' });
+    }
+
+    try {
+        let mailStatus = 'sent';
+        let mailError = null;
+
+        if (transporter) {
+            try {
+                await transporter.sendMail({
+                    from: process.env.SMTP_FROM || `"Genius Minds Homeschooling" <${process.env.SMTP_USER}>`,
+                    to: recipient,
+                    subject: subject,
+                    html: body
+                });
+                console.log(`📧 Composed email sent successfully to ${recipient}`);
+            } catch (err) {
+                console.error('📧 Composed email sending failed:', err);
+                mailStatus = 'failed';
+                mailError = err.message;
+            }
+        } else {
+            console.log('-------------------------------------------');
+            console.log('MOCK EMAIL SENDING (SMTP credentials empty)');
+            console.log(`To: ${recipient}`);
+            console.log(`Subject: ${subject}`);
+            console.log(`Body:\n${body}`);
+            console.log('-------------------------------------------');
+            mailStatus = 'logged_to_console';
+        }
+
+        // Log the manual email send (booking_id is null)
+        await db.query(
+            'INSERT INTO email_logs (booking_id, recipient, subject, body, status, error_message) VALUES (?, ?, ?, ?, ?, ?)',
+            [null, recipient, subject, body, mailStatus, mailError]
+        );
+
+        if (mailStatus === 'failed') {
+            return res.status(500).json({ error: 'Failed to send email: ' + mailError });
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error in send manual email route:', err);
+        res.status(500).json({ error: 'Failed to process email dispatch.' });
     }
 });
 
@@ -1405,17 +2650,804 @@ app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
 });
 
 // ==========================================
+// END OF API ENDPOINTS
+// ==========================================
+
+// WhatsApp Disconnect API
+app.post('/api/admin/whatsapp/disconnect', requireAdmin, async (req, res) => {
+    try {
+        await whatsappService.disconnect();
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error disconnecting WhatsApp:', err);
+        res.status(500).json({ error: 'Failed to disconnect WhatsApp.' });
+    }
+});
+
+// ==========================================
+// HIGHLIGHTS BANNERS API
+// ==========================================
+
+// 1. Public: Get active banners (filtered by schedule)
+app.get('/api/banners', async (req, res) => {
+    try {
+        const banners = await db.query('SELECT * FROM highlights_banners');
+        const now = new Date();
+        const activeBanners = banners
+            .filter(b => {
+                const isActive = b.is_active === undefined || b.is_active == 1;
+                const hasStarted = !b.start_date || now >= new Date(b.start_date);
+                const notExpired = !b.end_date || now <= new Date(b.end_date);
+                return isActive && hasStarted && notExpired;
+            })
+            .sort((a, b) => a.id - b.id);
+        res.json(activeBanners);
+    } catch (err) {
+        console.error('Error fetching highlights banners:', err);
+        res.status(500).json({ error: 'Failed to retrieve banners.' });
+    }
+});
+
+// 2. Admin: Get all banners
+app.get('/api/admin/banners', requireAdmin, async (req, res) => {
+    try {
+        const banners = await db.query('SELECT * FROM highlights_banners ORDER BY id ASC');
+        res.json(banners);
+    } catch (err) {
+        console.error('Error fetching admin highlights banners:', err);
+        res.status(500).json({ error: 'Failed to retrieve banners.' });
+    }
+});
+
+// 3. Admin: Create banner
+app.post('/api/admin/banners', requireAdmin, upload.single('image'), async (req, res) => {
+    try {
+        const {
+            banner_type, badge_text, badge_class, title, subtitle,
+            btn_primary_action, btn_secondary_action,
+            is_active, start_date, end_date,
+            event_start_date, event_end_date
+        } = req.body;
+
+        console.log('[BANNER CREATE] Request body:', { banner_type, badge_text, badge_class, title, subtitle, btn_primary_action, btn_secondary_action, is_active, start_date, end_date, event_start_date, event_end_date });
+
+        if (!badge_text || !title || !subtitle) {
+            return res.status(400).json({ error: 'badge_text, title, and subtitle are required.' });
+        }
+
+        const imagePath = req.file ? `/uploads/${req.file.filename}` : (req.body.image_path || null);
+
+        const result = await db.query(`
+            INSERT INTO highlights_banners
+                (banner_type, badge_text, badge_class, title, subtitle,
+                 btn_primary_action, btn_secondary_action,
+                 image_path, is_active, start_date, end_date,
+                 event_start_date, event_end_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [banner_type || 'standard', badge_text, badge_class || 'event-badge', title, subtitle,
+            btn_primary_action || null, btn_secondary_action || null,
+                imagePath, is_active !== undefined ? parseInt(is_active) : 1,
+            start_date || null, end_date || null,
+            event_start_date || null, event_end_date || null]
+        );
+        console.log('[BANNER CREATE] Success - ID:', result.insertId);
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('[BANNER CREATE] Error:', err);
+        res.status(500).json({ error: 'Failed to create banner.' });
+    }
+});
+
+// 4. Admin: Update banner
+app.put('/api/admin/banners/:id', requireAdmin, upload.single('image'), async (req, res) => {
+    const bannerId = req.params.id;
+    try {
+        const banners = await db.query('SELECT * FROM highlights_banners');
+        const existingBanner = banners.find(b => b.id == bannerId);
+        if (!existingBanner) return res.status(404).json({ error: 'Banner not found.' });
+
+        const {
+            banner_type, badge_text, badge_class, title, subtitle,
+            btn_primary_action, btn_secondary_action,
+            is_active, start_date, end_date,
+            event_start_date, event_end_date
+        } = req.body;
+
+        const imagePath = req.file ? `/uploads/${req.file.filename}` : (existingBanner.image_path);
+
+        await db.query(`
+            UPDATE highlights_banners SET
+                banner_type = ?, badge_text = ?, badge_class = ?, title = ?, subtitle = ?,
+                btn_primary_action = ?, btn_secondary_action = ?,
+                image_path = ?, is_active = ?, start_date = ?, end_date = ?,
+                event_start_date = ?, event_end_date = ?
+            WHERE id = ?`,
+            [banner_type || 'standard', badge_text, badge_class || 'event-badge', title, subtitle,
+            btn_primary_action || null, btn_secondary_action || null,
+                imagePath, is_active !== undefined ? parseInt(is_active) : 1,
+            start_date || null, end_date || null,
+            event_start_date || null, event_end_date || null,
+                bannerId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating banner:', err);
+        res.status(500).json({ error: 'Failed to update banner.' });
+    }
+});
+
+// 5. Admin: Delete banner
+app.delete('/api/admin/banners/:id', requireAdmin, async (req, res) => {
+    const bannerId = req.params.id;
+    try {
+        const banners = await db.query('SELECT * FROM highlights_banners');
+        const existingBanner = banners.find(b => b.id == bannerId);
+        if (!existingBanner) return res.status(404).json({ error: 'Banner not found.' });
+
+        // Delete image file if it was uploaded
+        if (existingBanner.image_path && existingBanner.image_path.startsWith('/uploads/')) {
+            const filePath = path.join(__dirname, existingBanner.image_path);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+
+        await db.query('DELETE FROM highlights_banners WHERE id = ?', [bannerId]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting banner:', err);
+        res.status(500).json({ error: 'Failed to delete banner.' });
+    }
+});
+
+// 6. Admin: Toggle banner visibility (Show/Hide)
+app.patch('/api/admin/banners/:id/toggle', requireAdmin, async (req, res) => {
+    const bannerId = req.params.id;
+    try {
+        const banners = await db.query('SELECT * FROM highlights_banners');
+        const existingBanner = banners.find(b => b.id == bannerId);
+        if (!existingBanner) return res.status(404).json({ error: 'Banner not found.' });
+
+        const newStatus = existingBanner.is_active == 1 ? 0 : 1;
+        await db.query('UPDATE highlights_banners SET is_active = ? WHERE id = ?', [newStatus, bannerId]);
+        res.json({ success: true, is_active: newStatus });
+    } catch (err) {
+        console.error('Error toggling banner visibility:', err);
+        res.status(500).json({ error: 'Failed to toggle banner visibility.' });
+    }
+});
+
+// ==========================================
+// SITE SETTINGS APIs
+// ==========================================
+
+// Public: Get Settings
+app.get('/api/settings', async (req, res) => {
+    try {
+        const settingsArr = await db.query('SELECT setting_key, setting_value FROM site_settings');
+        // Convert array to key-value map
+        const settings = {};
+        settingsArr.forEach(s => settings[s.setting_key] = s.setting_value);
+        res.json(settings);
+    } catch (err) {
+        console.error('Error fetching public settings:', err);
+        res.status(500).json({ error: 'Failed to load settings.' });
+    }
+});
+
+// Admin: Get Settings
+app.get('/api/admin/settings', requireAdmin, async (req, res) => {
+    try {
+        const settingsArr = await db.query('SELECT setting_key, setting_value FROM site_settings');
+        const settings = {};
+        settingsArr.forEach(s => settings[s.setting_key] = s.setting_value);
+        res.json(settings);
+    } catch (err) {
+        console.error('Error fetching admin settings:', err);
+        res.status(500).json({ error: 'Failed to load settings.' });
+    }
+});
+
+// Admin: Update Settings
+app.put('/api/admin/settings', requireAdmin, async (req, res) => {
+    const newSettings = req.body;
+    try {
+        for (const [key, value] of Object.entries(newSettings)) {
+            // Upsert mechanism depending on database driver
+            if (dbMode === 'memory') {
+                const existing = memDb.site_settings.find(s => s.setting_key === key);
+                if (existing) {
+                    existing.setting_value = value;
+                } else {
+                    memDb.site_settings.push({ setting_key: key, setting_value: value });
+                }
+            } else if (dbMode === 'sqlite') {
+                await dbConnection.run(
+                    'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON CONFLICT(setting_key) DO UPDATE SET setting_value = ?, updated_at = CURRENT_TIMESTAMP',
+                    [key, value, value]
+                );
+            } else if (dbMode === 'mysql') {
+                await dbPool.query(
+                    'INSERT INTO site_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?',
+                    [key, value, value]
+                );
+            }
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating settings:', err);
+        res.status(500).json({ error: 'Failed to update settings.' });
+    }
+});
+
+// ==========================================
+// SOCIAL MEDIA LINKS APIs
+// ==========================================
+
+// Public: Get all social media links
+app.get('/api/social-media', async (req, res) => {
+    try {
+        const links = await db.query('SELECT * FROM social_media ORDER BY display_order ASC');
+        res.json(links);
+    } catch (err) {
+        console.error('Error fetching social media links:', err);
+        res.status(500).json({ error: 'Failed to load social media links.' });
+    }
+});
+
+// Admin: Get all social media links
+app.get('/api/admin/social-media', requireAdmin, async (req, res) => {
+    try {
+        const links = await db.query('SELECT * FROM social_media ORDER BY display_order ASC');
+        res.json(links);
+    } catch (err) {
+        console.error('Error fetching social media links:', err);
+        res.status(500).json({ error: 'Failed to load social media links.' });
+    }
+});
+
+// Admin: Create social media link
+app.post('/api/admin/social-media', requireAdmin, async (req, res) => {
+    try {
+        const { name, url, icon, display_order } = req.body;
+
+        if (!name || !url) {
+            return res.status(400).json({ error: 'Name and URL are required.' });
+        }
+
+        const result = await db.query(
+            'INSERT INTO social_media (name, url, icon, display_order) VALUES (?, ?, ?, ?)',
+            [name, url, icon || null, parseInt(display_order) || 0]
+        );
+
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating social media link:', err);
+        res.status(500).json({ error: 'Failed to create social media link.' });
+    }
+});
+
+// Admin: Update social media link
+app.put('/api/admin/social-media/:id', requireAdmin, async (req, res) => {
+    const linkId = req.params.id;
+    try {
+        const { name, url, icon, display_order } = req.body;
+
+        if (!name || !url) {
+            return res.status(400).json({ error: 'Name and URL are required.' });
+        }
+
+        await db.query(
+            'UPDATE social_media SET name = ?, url = ?, icon = ?, display_order = ? WHERE id = ?',
+            [name, url, icon || null, parseInt(display_order) || 0, linkId]
+        );
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating social media link:', err);
+        res.status(500).json({ error: 'Failed to update social media link.' });
+    }
+});
+
+// Admin: Delete social media link
+app.delete('/api/admin/social-media/:id', requireAdmin, async (req, res) => {
+    const linkId = req.params.id;
+    try {
+        await db.query('DELETE FROM social_media WHERE id = ?', [linkId]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting social media link:', err);
+        res.status(500).json({ error: 'Failed to delete social media link.' });
+    }
+});
+
+// ==========================================
+// SOCIAL MEDIA APIs
+// ==========================================
+
+// Public: Get all social media links (sorted by display_order)
+app.get('/api/social-media', async (req, res) => {
+    try {
+        const links = await db.query('SELECT * FROM social_media ORDER BY display_order ASC');
+        res.json(links);
+    } catch (err) {
+        console.error('Error fetching social media links:', err);
+        res.status(500).json({ error: 'Failed to load social media links.' });
+    }
+});
+
+// Admin: Get all social media links
+app.get('/api/admin/social-media', requireAdmin, async (req, res) => {
+    try {
+        const links = await db.query('SELECT * FROM social_media ORDER BY display_order ASC');
+        res.json(links);
+    } catch (err) {
+        console.error('Error fetching admin social media:', err);
+        res.status(500).json({ error: 'Failed to load social media links.' });
+    }
+});
+
+// Admin: Create a social media link
+app.post('/api/admin/social-media', requireAdmin, async (req, res) => {
+    const { name, url, icon, display_order } = req.body;
+    if (!name || !url) {
+        return res.status(400).json({ error: 'Platform name and URL are required.' });
+    }
+    try {
+        const result = await db.query(
+            'INSERT INTO social_media (name, url, icon, display_order) VALUES (?, ?, ?, ?)',
+            [name.trim(), url.trim(), icon || null, parseInt(display_order) || 0]
+        );
+        res.json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating social media link:', err);
+        res.status(500).json({ error: 'Failed to create social media link.' });
+    }
+});
+
+// Admin: Update a social media link
+app.put('/api/admin/social-media/:id', requireAdmin, async (req, res) => {
+    const { name, url, icon, display_order } = req.body;
+    const { id } = req.params;
+    if (!name || !url) {
+        return res.status(400).json({ error: 'Platform name and URL are required.' });
+    }
+    try {
+        await db.query(
+            'UPDATE social_media SET name = ?, url = ?, icon = ?, display_order = ? WHERE id = ?',
+            [name.trim(), url.trim(), icon || null, parseInt(display_order) || 0, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating social media link:', err);
+        res.status(500).json({ error: 'Failed to update social media link.' });
+    }
+});
+
+// Admin: Delete a social media link
+app.delete('/api/admin/social-media/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM social_media WHERE id = ?', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting social media link:', err);
+        res.status(500).json({ error: 'Failed to delete social media link.' });
+    }
+});
+
+// ==========================================
+// CUSTOM CMS API ENDPOINTS
+// ==========================================
+
+// --- 1. TEAM MEMBERS ---
+
+// Public: Get all team members
+app.get('/api/team', async (req, res) => {
+    try {
+        const team = await db.query('SELECT * FROM team_members ORDER BY display_order ASC');
+        res.json(team);
+    } catch (err) {
+        console.error('Error fetching team members:', err);
+        res.status(500).json({ error: 'Failed to retrieve team members.' });
+    }
+});
+
+// Admin: Get all team members
+app.get('/api/admin/team', requireAdmin, async (req, res) => {
+    try {
+        const team = await db.query('SELECT * FROM team_members ORDER BY display_order ASC');
+        res.json(team);
+    } catch (err) {
+        console.error('Error fetching admin team members:', err);
+        res.status(500).json({ error: 'Failed to retrieve team members.' });
+    }
+});
+
+// Admin: Create team member
+app.post('/api/admin/team', requireAdmin, upload.single('image'), async (req, res) => {
+    try {
+        const { name, role, bio, display_order } = req.body;
+        if (!name || !role) {
+            return res.status(400).json({ error: 'Name and role are required.' });
+        }
+        const imageUrl = req.file ? `/uploads/${req.file.filename}` : (req.body.image_url || null);
+        const result = await db.query(
+            'INSERT INTO team_members (name, role, bio, image_url, display_order) VALUES (?, ?, ?, ?, ?)',
+            [name, role, bio || null, imageUrl, parseInt(display_order) || 0]
+        );
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating team member:', err);
+        res.status(500).json({ error: 'Failed to create team member.' });
+    }
+});
+
+// Admin: Update team member
+app.put('/api/admin/team/:id', requireAdmin, upload.single('image'), async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { name, role, bio, display_order } = req.body;
+        if (!name || !role) {
+            return res.status(400).json({ error: 'Name and role are required.' });
+        }
+        const team = await db.query('SELECT * FROM team_members');
+        const member = team.find(t => t.id == id);
+        if (!member) return res.status(404).json({ error: 'Team member not found.' });
+
+        const imageUrl = req.file ? `/uploads/${req.file.filename}` : (req.body.image_url || member.image_url);
+        await db.query(
+            'UPDATE team_members SET name = ?, role = ?, bio = ?, image_url = ?, display_order = ? WHERE id = ?',
+            [name, role, bio || null, imageUrl, parseInt(display_order) || 0, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating team member:', err);
+        res.status(500).json({ error: 'Failed to update team member.' });
+    }
+});
+
+// Admin: Delete team member
+app.delete('/api/admin/team/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM team_members WHERE id = ?', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting team member:', err);
+        res.status(500).json({ error: 'Failed to delete team member.' });
+    }
+});
+
+// --- 2. COURSES ---
+
+// Public: Get all courses
+app.get('/api/courses', async (req, res) => {
+    try {
+        const courses = await db.query('SELECT * FROM courses');
+        res.json(courses);
+    } catch (err) {
+        console.error('Error fetching courses:', err);
+        res.status(500).json({ error: 'Failed to retrieve courses.' });
+    }
+});
+
+// Admin: Get all courses
+app.get('/api/admin/courses', requireAdmin, async (req, res) => {
+    try {
+        const courses = await db.query('SELECT * FROM courses');
+        res.json(courses);
+    } catch (err) {
+        console.error('Error fetching admin courses:', err);
+        res.status(500).json({ error: 'Failed to retrieve courses.' });
+    }
+});
+
+// Admin: Create course
+app.post('/api/admin/courses', requireAdmin, async (req, res) => {
+    try {
+        const { title, grade_levels, subjects, description, duration, fees, outcomes } = req.body;
+        if (!title) return res.status(400).json({ error: 'Title is required.' });
+        const result = await db.query(
+            'INSERT INTO courses (title, grade_levels, subjects, description, duration, fees, outcomes) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [title, grade_levels || null, subjects || null, description || null, duration || null, fees || null, outcomes || null]
+        );
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating course:', err);
+        res.status(500).json({ error: 'Failed to create course.' });
+    }
+});
+
+// Admin: Update course
+app.put('/api/admin/courses/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { title, grade_levels, subjects, description, duration, fees, outcomes } = req.body;
+        if (!title) return res.status(400).json({ error: 'Title is required.' });
+
+        const courses = await db.query('SELECT * FROM courses');
+        const course = courses.find(c => c.id == id);
+        if (!course) return res.status(404).json({ error: 'Course not found.' });
+
+        await db.query(
+            'UPDATE courses SET title = ?, grade_levels = ?, subjects = ?, description = ?, duration = ?, fees = ?, outcomes = ? WHERE id = ?',
+            [title, grade_levels || null, subjects || null, description || null, duration || null, fees || null, outcomes || null, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating course:', err);
+        res.status(500).json({ error: 'Failed to update course.' });
+    }
+});
+
+// Admin: Delete course
+app.delete('/api/admin/courses/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM courses WHERE id = ?', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting course:', err);
+        res.status(500).json({ error: 'Failed to delete course.' });
+    }
+});
+
+// --- 3. FAQS ---
+
+// Public: Get all FAQs
+app.get('/api/faqs', async (req, res) => {
+    try {
+        const faqs = await db.query('SELECT * FROM faqs ORDER BY display_order ASC');
+        res.json(faqs);
+    } catch (err) {
+        console.error('Error fetching FAQs:', err);
+        res.status(500).json({ error: 'Failed to retrieve FAQs.' });
+    }
+});
+
+// Admin: Get all FAQs
+app.get('/api/admin/faqs', requireAdmin, async (req, res) => {
+    try {
+        const faqs = await db.query('SELECT * FROM faqs ORDER BY display_order ASC');
+        res.json(faqs);
+    } catch (err) {
+        console.error('Error fetching admin FAQs:', err);
+        res.status(500).json({ error: 'Failed to retrieve FAQs.' });
+    }
+});
+
+// Admin: Create FAQ
+app.post('/api/admin/faqs', requireAdmin, async (req, res) => {
+    try {
+        const { question, answer, category, display_order } = req.body;
+        if (!question || !answer) {
+            return res.status(400).json({ error: 'Question and answer are required.' });
+        }
+        const result = await db.query(
+            'INSERT INTO faqs (question, answer, category, display_order) VALUES (?, ?, ?, ?)',
+            [question, answer, category || 'General', parseInt(display_order) || 0]
+        );
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating FAQ:', err);
+        res.status(500).json({ error: 'Failed to create FAQ.' });
+    }
+});
+
+// Admin: Update FAQ
+app.put('/api/admin/faqs/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { question, answer, category, display_order } = req.body;
+        if (!question || !answer) {
+            return res.status(400).json({ error: 'Question and answer are required.' });
+        }
+        const faqs = await db.query('SELECT * FROM faqs');
+        const faq = faqs.find(f => f.id == id);
+        if (!faq) return res.status(404).json({ error: 'FAQ not found.' });
+
+        await db.query(
+            'UPDATE faqs SET question = ?, answer = ?, category = ?, display_order = ? WHERE id = ?',
+            [question, answer, category || 'General', parseInt(display_order) || 0, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating FAQ:', err);
+        res.status(500).json({ error: 'Failed to update FAQ.' });
+    }
+});
+
+// Admin: Delete FAQ
+app.delete('/api/admin/faqs/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM faqs WHERE id = ?', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting FAQ:', err);
+        res.status(500).json({ error: 'Failed to delete FAQ.' });
+    }
+});
+
+// --- 4. BLOG POSTS ---
+
+// Public: Get all blog posts
+app.get('/api/blog', async (req, res) => {
+    try {
+        const blogs = await db.query('SELECT * FROM blog_posts ORDER BY created_at DESC');
+        res.json(blogs);
+    } catch (err) {
+        console.error('Error fetching blog posts:', err);
+        res.status(500).json({ error: 'Failed to retrieve blog posts.' });
+    }
+});
+
+// Public: Get single blog post
+app.get('/api/blog/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const blogs = await db.query('SELECT * FROM blog_posts');
+        const post = blogs.find(b => b.id == id);
+        if (!post) return res.status(404).json({ error: 'Blog post not found.' });
+        res.json(post);
+    } catch (err) {
+        console.error('Error fetching blog post:', err);
+        res.status(500).json({ error: 'Failed to retrieve blog post.' });
+    }
+});
+
+// Admin: Get all blog posts
+app.get('/api/admin/blog', requireAdmin, async (req, res) => {
+    try {
+        const blogs = await db.query('SELECT * FROM blog_posts ORDER BY created_at DESC');
+        res.json(blogs);
+    } catch (err) {
+        console.error('Error fetching admin blogs:', err);
+        res.status(500).json({ error: 'Failed to retrieve blogs.' });
+    }
+});
+
+// Admin: Create blog post
+app.post('/api/admin/blog', requireAdmin, upload.single('image'), async (req, res) => {
+    try {
+        const { title, excerpt, content, author, category } = req.body;
+        if (!title || !content) {
+            return res.status(400).json({ error: 'Title and content are required.' });
+        }
+        const imageUrl = req.file ? `/uploads/${req.file.filename}` : (req.body.image_url || null);
+        const result = await db.query(
+            'INSERT INTO blog_posts (title, excerpt, content, author, category, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+            [title, excerpt || null, content, author || 'Admin', category || 'General', imageUrl]
+        );
+        res.status(201).json({ success: true, id: result.insertId });
+    } catch (err) {
+        console.error('Error creating blog post:', err);
+        res.status(500).json({ error: 'Failed to create blog post.' });
+    }
+});
+
+// Admin: Update blog post
+app.put('/api/admin/blog/:id', requireAdmin, upload.single('image'), async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { title, excerpt, content, author, category } = req.body;
+        if (!title || !content) {
+            return res.status(400).json({ error: 'Title and content are required.' });
+        }
+        const blogs = await db.query('SELECT * FROM blog_posts');
+        const post = blogs.find(b => b.id == id);
+        if (!post) return res.status(404).json({ error: 'Blog post not found.' });
+
+        const imageUrl = req.file ? `/uploads/${req.file.filename}` : (req.body.image_url || post.image_url);
+        await db.query(
+            'UPDATE blog_posts SET title = ?, excerpt = ?, content = ?, author = ?, category = ?, image_url = ? WHERE id = ?',
+            [title, excerpt || null, content, author || 'Admin', category || 'General', imageUrl, id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating blog post:', err);
+        res.status(500).json({ error: 'Failed to update blog post.' });
+    }
+});
+
+// Admin: Delete blog post
+app.delete('/api/admin/blog/:id', requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        await db.query('DELETE FROM blog_posts WHERE id = ?', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error deleting blog post:', err);
+        res.status(500).json({ error: 'Failed to delete blog post.' });
+    }
+});
+
+// --- 5. PAGE CONTENT (Key-Value) ---
+
+// Public: Get all page content
+app.get('/api/content', async (req, res) => {
+    try {
+        const content = await db.query('SELECT * FROM page_content');
+        const formatted = {};
+        content.forEach(c => {
+            formatted[c.content_key] = c.content_value;
+        });
+        res.json(formatted);
+    } catch (err) {
+        console.error('Error fetching page content:', err);
+        res.status(500).json({ error: 'Failed to retrieve page content.' });
+    }
+});
+
+// Admin: Get raw page content key-values
+app.get('/api/admin/content', requireAdmin, async (req, res) => {
+    try {
+        const content = await db.query('SELECT * FROM page_content');
+        const formatted = {};
+        content.forEach(c => {
+            formatted[c.content_key] = c.content_value;
+        });
+        res.json(formatted);
+    } catch (err) {
+        console.error('Error fetching admin page content:', err);
+        res.status(500).json({ error: 'Failed to retrieve page content.' });
+    }
+});
+
+// Admin: Bulk update page content
+app.post('/api/admin/content', requireAdmin, async (req, res) => {
+    try {
+        const updates = req.body;
+        for (const [key, value] of Object.entries(updates)) {
+            if (dbMode === 'memory') {
+                const existing = memDb.page_content.find(p => p.content_key === key);
+                if (existing) {
+                    existing.content_value = value;
+                    existing.updated_at = new Date();
+                } else {
+                    memDb.page_content.push({
+                        id: memDb.page_content.length + 1,
+                        content_key: key,
+                        content_value: value,
+                        created_at: new Date(),
+                        updated_at: new Date()
+                    });
+                }
+            } else if (dbMode === 'sqlite') {
+                await dbConnection.run(
+                    'INSERT INTO page_content (content_key, content_value) VALUES (?, ?) ON CONFLICT(content_key) DO UPDATE SET content_value = ?, updated_at = CURRENT_TIMESTAMP',
+                    [key, value, value]
+                );
+            } else if (dbMode === 'mysql') {
+                await dbPool.query(
+                    'INSERT INTO page_content (content_key, content_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE content_value = ?',
+                    [key, value, value]
+                );
+            }
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error updating page content:', err);
+        res.status(500).json({ error: 'Failed to update page content.' });
+    }
+});
+
+// ==========================================
 // SERVING STATIC ASSETS & FILES
 // ==========================================
 
+// Serve uploaded files (attachments from chat)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // Route for static admin files (must be before the root static serving)
 app.use('/admin', express.static(path.join(__dirname, 'admin')));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Custom route to redirect users directly to admin panel login if not logged in
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin', 'index.html'));
 });
+
+// Route for public pages (track.html, etc.) — serves /public as root-level URLs
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Route for general static website (landing page, script.js, styles.css)
 app.use(express.static(path.join(__dirname)));
@@ -1432,4 +3464,7 @@ app.listen(PORT, () => {
     console.log(`🔗 Local Address: http://localhost:${PORT}`);
     console.log(`🔗 Admin Dashboard: http://localhost:${PORT}/admin`);
     console.log(`=======================================================`);
+
+    // Initialize WhatsApp
+    whatsappService.initialize();
 });

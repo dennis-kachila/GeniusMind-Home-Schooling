@@ -6,9 +6,10 @@
     <title>Admin Dashboard | Genius Minds Homeschooling</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="icon" type="image/png" href="../assets/images/logo-favicon.png">
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=3">
 </head>
 <body>
+    <div id="sidebarOverlay" class="sidebar-overlay"></div>
     <!-- App Container -->
     <div class="app-layout">
         <!-- Sidebar Navigation -->
@@ -40,6 +41,35 @@
                 <a href="#banners" class="nav-item" data-tab="banners">
                     <span class="nav-icon">🖼️</span> Banners
                 </a>
+                <div class="nav-group">
+                    <button class="nav-group-toggle" id="systemConfigToggle">
+                        <span class="nav-icon">🛠️</span> System Config
+                        <span class="chevron">▼</span>
+                    </button>
+                    <div class="nav-group-items open" id="systemConfigMenu">
+                        <a href="#pages" class="nav-item" data-tab="pages">
+                            <span class="nav-icon">📝</span> Pages & Content
+                        </a>
+                        <a href="#team" class="nav-item" data-tab="team">
+                            <span class="nav-icon">👨‍🏫</span> Team Members
+                        </a>
+                        <a href="#courses" class="nav-item" data-tab="courses">
+                            <span class="nav-icon">📚</span> Courses / Programs
+                        </a>
+                        <a href="#faqs" class="nav-item" data-tab="faqs">
+                            <span class="nav-icon">❓</span> FAQs
+                        </a>
+                        <a href="#blog" class="nav-item" data-tab="blog">
+                            <span class="nav-icon">📰</span> Blog & News
+                        </a>
+                        <a href="#settings" class="nav-item" data-tab="settings">
+                            <span class="nav-icon">⚙️</span> Site Settings
+                        </a>
+                        <a href="#social" class="nav-item" data-tab="social">
+                            <span class="nav-icon">🌐</span> Social Media
+                        </a>
+                    </div>
+                </div>
             </nav>
             
             <div class="sidebar-footer">
@@ -57,8 +87,20 @@
         <main class="main-content">
             <!-- Header bar -->
             <header class="top-bar">
-                <h1 class="page-title" id="pageTitle">System Overview</h1>
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <button id="mobileSidebarBtn" class="mobile-sidebar-btn" aria-label="Toggle Menu">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="3" y1="12" x2="21" y2="12"></line>
+                            <line x1="3" y1="6" x2="21" y2="6"></line>
+                            <line x1="3" y1="18" x2="21" y2="18"></line>
+                        </svg>
+                    </button>
+                    <h1 class="page-title" id="pageTitle">System Overview</h1>
+                </div>
                 <div class="user-controls">
+                    <button id="themeToggle" class="btn-theme-toggle" title="Toggle Light/Dark Mode">
+                        <span class="theme-icon">🌙</span>
+                    </button>
                     <div class="user-info">
                         <span class="user-avatar" id="userAvatar">A</span>
                         <div class="user-text">
@@ -161,6 +203,28 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- WhatsApp Integration Card -->
+                    <div class="whatsapp-card-container" style="margin-top: 2rem;">
+                        <div class="chart-card">
+                            <h3>WhatsApp Integration</h3>
+                            <div class="whatsapp-status-wrapper" style="display: flex; align-items: center; gap: 1.5rem; padding: 1rem;">
+                                <div class="whatsapp-icon" style="font-size: 3rem; color: #25D366;">
+                                    💬
+                                </div>
+                                <div class="whatsapp-info" style="flex: 1;">
+                                    <h4 style="margin: 0 0 0.5rem 0;">Connection Status: <span id="waStatusText" style="color: #666;">Checking...</span></h4>
+                                    <p id="waPhoneDisplay" style="margin: 0.5rem 0 0.8rem 0; color: #25D366; font-size: 0.95rem; font-weight: 600; display: none;">📱 Connected Account: <span id="waPhoneNumber"></span></p>
+                                    <p style="margin: 0 0 0.8rem 0; color: #666; font-size: 0.9rem;">This service handles sending WhatsApp notifications to the admin and customers.</p>
+                                    <button id="waDisconnectBtn" class="btn-whatsapp-disconnect" style="display: none;">Disconnect WhatsApp</button>
+                                </div>
+                                <div id="waQrContainer" style="display: none; text-align: center;">
+                                    <img id="waQrImage" src="" alt="WhatsApp QR Code" style="max-width: 150px; border: 1px solid #ddd; border-radius: 8px;">
+                                    <p style="margin: 0.5rem 0 0 0; font-size: 0.8rem; color: #666;">Scan to connect</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </section>
 
                 <!-- Section 2: Bookings -->
@@ -181,7 +245,8 @@
                     </div>
                     
                     <div class="table-container">
-                        <table class="data-table">
+                        <div class="table-responsive">
+                            <table class="data-table">
                             <thead>
                                 <tr>
                                     <th>Parent Name</th>
@@ -190,21 +255,24 @@
                                     <th>Additional Notes</th>
                                     <th>Created At</th>
                                     <th>Status</th>
+                                    <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="bookingsTableBody">
                                 <tr>
-                                    <td colspan="6" class="text-center">Loading booking records...</td>
+                                    <td colspan="7" class="text-center">Loading booking records...</td>
                                 </tr>
                             </tbody>
                         </table>
+                        </div>
                     </div>
                 </section>
 
                 <!-- Section 3: Email Dispatch -->
                 <section id="tab-emails" class="tab-content">
                     <div class="table-container">
-                        <table class="data-table">
+                        <div class="table-responsive">
+                            <table class="data-table">
                             <thead>
                                 <tr>
                                     <th>Log ID</th>
@@ -222,17 +290,38 @@
                                 </tr>
                             </tbody>
                         </table>
+                        </div>
                     </div>
                 </section>
 
                 <!-- Section 4: Visitor Analytics (Google Analytics Style Dashboard) -->
                 <section id="tab-analytics" class="tab-content">
+
+                    <!-- Date Range Picker Bar -->
+                    <div class="analytics-date-bar">
+                        <div class="date-presets">
+                            <button class="date-preset-btn active" data-preset="today">Today</button>
+                            <button class="date-preset-btn" data-preset="7d">Last 7 Days</button>
+                            <button class="date-preset-btn" data-preset="30d">Last 30 Days</button>
+                            <button class="date-preset-btn" data-preset="month">This Month</button>
+                            <button class="date-preset-btn" data-preset="year">This Year</button>
+                        </div>
+                        <div class="date-custom-range">
+                            <label>From:</label>
+                            <input type="date" id="analyticsStartDate" class="date-input">
+                            <label>To:</label>
+                            <input type="date" id="analyticsEndDate" class="date-input">
+                            <button id="applyDateRange" class="btn-apply-range">Apply</button>
+                        </div>
+                        <div class="analytics-range-label" id="analyticsRangeLabel">Last 30 Days</div>
+                    </div>
+
                     <!-- Top metrics grid (3 columns) -->
                     <div class="ga-metrics-grid">
-                        <!-- Card 1: Countries -->
+                        <!-- Card 1: Locations -->
                         <div class="ga-card">
                             <div class="ga-card-header">
-                                <h3>Countries</h3>
+                                <h3>📍 Locations (Counties)</h3>
                                 <span class="ga-card-sub text-muted">VISITORS</span>
                             </div>
                             <div class="ga-card-body" id="gaCountriesList">
@@ -294,6 +383,38 @@
                         </div>
                     </div>
 
+                    <!-- Top Pages full-width row -->
+                    <div class="ga-metrics-grid span-2-col" style="margin-top:0;">
+                        <!-- Card 6: Top Pages -->
+                        <div class="ga-card">
+                            <div class="ga-card-header text-split">
+                                <h3>📄 Top Pages</h3>
+                                <div class="ga-card-cols text-muted">
+                                    <span>UNIQUE VISITORS</span>
+                                    <span>TOTAL VIEWS</span>
+                                </div>
+                            </div>
+                            <div class="ga-card-body" id="gaPagesList">
+                                <!-- Dynamic rows -->
+                            </div>
+                        </div>
+
+                        <!-- Card 7: Visitor Timeline Summary -->
+                        <div class="ga-card">
+                            <div class="ga-card-header">
+                                <h3>📅 Visits by Period</h3>
+                                <div class="ga-groupby-tabs">
+                                    <button class="ga-groupby-btn active" data-group="day">Day</button>
+                                    <button class="ga-groupby-btn" data-group="week">Week</button>
+                                    <button class="ga-groupby-btn" data-group="month">Month</button>
+                                </div>
+                            </div>
+                            <div class="ga-card-body" id="gaTimelineSummaryList">
+                                <!-- Dynamic rows -->
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Diagnostic Toggler Button -->
                     <div class="diagnostic-toggler-container">
                         <button id="toggleDiagnosticLogs" class="btn btn-diagnostic-toggle">⚙️ Show Diagnostic Activity Logs</button>
@@ -306,7 +427,8 @@
                             <div class="analytics-panel">
                                 <h3>Recent Visitor Sessions</h3>
                                 <div class="table-container small">
-                                    <table class="data-table">
+                                    <div class="table-responsive">
+                            <table class="data-table">
                                         <thead>
                                             <tr>
                                                 <th>Session ID</th>
@@ -321,6 +443,7 @@
                                             </tr>
                                         </tbody>
                                     </table>
+                        </div>
                                 </div>
                             </div>
 
@@ -328,7 +451,8 @@
                             <div class="analytics-panel">
                                 <h3>Live Event Feed</h3>
                                 <div class="table-container small">
-                                    <table class="data-table">
+                                    <div class="table-responsive">
+                            <table class="data-table">
                                         <thead>
                                             <tr>
                                                 <th>Time</th>
@@ -343,6 +467,7 @@
                                             </tr>
                                         </tbody>
                                     </table>
+                        </div>
                                 </div>
                             </div>
                         </div>
@@ -374,7 +499,8 @@
                         <div class="analytics-panel">
                             <h3>Active Administrative Credentials</h3>
                             <div class="table-container">
-                                <table class="data-table">
+                                <div class="table-responsive">
+                            <table class="data-table">
                                     <thead>
                                         <tr>
                                             <th>Username</th>
@@ -387,6 +513,7 @@
                                         </tr>
                                     </tbody>
                                 </table>
+                        </div>
                             </div>
                         </div>
                     </div>
@@ -405,6 +532,182 @@
                     <!-- Grid of existing banners -->
                     <div class="banners-grid" id="bannersGrid">
                         <!-- Dynamic banner cards will be loaded here -->
+                    </div>
+                </section>
+
+                <!-- Section 7: Site Settings -->
+                <section id="tab-settings" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Site Settings</h3>
+                            <p class="section-subtitle">Update the public-facing contact information displayed on the main website.</p>
+                        </div>
+                    </div>
+
+                    <div class="settings-form-card glass-card" style="max-width: 700px; padding: 30px; border-radius: 16px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);">
+                        <form id="siteSettingsForm">
+                    <div class="form-group-glass" style="margin-bottom: 20px;">
+                        <label for="setting_contact_phone" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">📞 Phone Number
+                            <span style="font-size: 11px; color: #10b981; font-weight: 400; margin-left: 8px;">🔒 Auto-synced from WhatsApp QR</span>
+                        </label>
+                        <input type="text" id="setting_contact_phone" name="contact_phone" placeholder="+254 743-322-975" readonly style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.03); color:#a0aec0; font-size:15px; cursor: not-allowed;">
+                        <p style="font-size: 12px; color: #94a3b8; margin-top: 8px;">💡 This phone number is automatically extracted when you scan a WhatsApp QR code. It's used for all notifications and contact links across the website. You cannot edit this field manually.</p>
+                    </div>
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="setting_contact_email" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">✉️ Email Address</label>
+                                <input type="email" id="setting_contact_email" name="contact_email" placeholder="geniusminds2425@gmail.com" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px;">
+                            </div>
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="setting_contact_location" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">📍 Location</label>
+                                <input type="text" id="setting_contact_location" name="contact_location" placeholder="Nairobi, Kenya" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px;">
+                            </div>
+                            <div style="display:flex; gap:12px; align-items:center; margin-top:24px;">
+                                <button type="submit" class="btn btn-primary" id="saveSettingsBtn">💾 Save Settings</button>
+                                <span id="settingsSaveStatus" style="color:#10b981; font-size:14px; display:none;">✅ Saved successfully!</span>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+                <!-- Section 8: Pages & Content -->
+                <section id="tab-pages" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage Page Content</h3>
+                            <p class="section-subtitle">Edit main text sections for the website such as Mission, Vision, and Teaching Philosophy.</p>
+                        </div>
+                    </div>
+
+                    <div class="settings-form-card glass-card" style="max-width: 800px; padding: 30px; border-radius: 16px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);">
+                        <form id="pagesContentForm">
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="content_mission_statement" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">🎯 Mission Statement</label>
+                                <textarea id="content_mission_statement" name="mission_statement" rows="3" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px; resize:vertical;"></textarea>
+                            </div>
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="content_vision" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">👁️ Vision Statement</label>
+                                <textarea id="content_vision" name="vision" rows="3" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px; resize:vertical;"></textarea>
+                            </div>
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="content_history" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">📜 History of Organization</label>
+                                <textarea id="content_history" name="history" rows="4" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px; resize:vertical;"></textarea>
+                            </div>
+                            <div class="form-group-glass" style="margin-bottom: 20px;">
+                                <label for="content_teaching_philosophy" style="display:block; margin-bottom:6px; font-weight:600; color:#cbd5e1;">💡 Teaching Philosophy</label>
+                                <textarea id="content_teaching_philosophy" name="teaching_philosophy" rows="4" style="width:100%; padding:12px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:#f8fafc; font-size:15px; resize:vertical;"></textarea>
+                            </div>
+                            <div style="display:flex; gap:12px; align-items:center; margin-top:24px;">
+                                <button type="submit" class="btn btn-primary" id="savePagesBtn">💾 Save Content</button>
+                                <span id="pagesSaveStatus" style="color:#10b981; font-size:14px; display:none;">✅ Content updated successfully!</span>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+
+                <!-- Section 9: Team Members -->
+                <section id="tab-team" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage Team Members</h3>
+                            <p class="section-subtitle">Add, edit, or remove teaching staff and specialists shown on the About Us page.</p>
+                        </div>
+                        <button id="addTeamBtn" class="btn btn-primary">➕ Add Team Member</button>
+                    </div>
+                    <div class="banners-grid" id="teamGrid">
+                        <!-- Dynamic team cards will load here -->
+                    </div>
+                </section>
+
+                <!-- Section 10: Courses / Programs -->
+                <section id="tab-courses" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage Courses & Programs</h3>
+                            <p class="section-subtitle">Create and update grade levels, subjects, fees, and outcomes for your learning programs.</p>
+                        </div>
+                        <button id="addCourseBtn" class="btn btn-primary">➕ Add Course</button>
+                    </div>
+                    <div class="table-container glass-card">
+                        <table class="data-table" id="coursesTable">
+                            <thead>
+                                <tr>
+                                    <th>Program Title</th>
+                                    <th>Grade Levels</th>
+                                    <th>Duration</th>
+                                    <th>Fees</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="coursesTableBody">
+                                <!-- Dynamic courses rows will load here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Section 11: FAQs -->
+                <section id="tab-faqs" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage FAQ List</h3>
+                            <p class="section-subtitle">Manage frequently asked questions, answers, and sorting orders for the FAQ page.</p>
+                        </div>
+                        <button id="addFaqBtn" class="btn btn-primary">➕ Add FAQ</button>
+                    </div>
+                    <div class="table-container glass-card">
+                        <table class="data-table" id="faqsTable">
+                            <thead>
+                                <tr>
+                                    <th>Question</th>
+                                    <th>Category</th>
+                                    <th>Order</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="faqsTableBody">
+                                <!-- Dynamic faqs rows will load here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Section 13: Social Media -->
+                <section id="tab-social" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage Social Media Links</h3>
+                            <p class="section-subtitle">Add, edit, or remove social media platform links. These are displayed in the website footer and contact page for visitors.</p>
+                        </div>
+                        <button id="addSocialBtn" class="btn btn-primary">➕ Add Social Link</button>
+                    </div>
+                    <div class="table-container glass-card">
+                        <table class="data-table" id="socialTable">
+                            <thead>
+                                <tr>
+                                    <th>Platform</th>
+                                    <th>URL</th>
+                                    <th>Order</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="socialTableBody">
+                                <!-- Dynamic social media rows will load here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- Section 12: Blog & News -->
+                <section id="tab-blog" class="tab-content">
+                    <div class="action-bar">
+                        <div class="section-info">
+                            <h3>Manage Blog & News Articles</h3>
+                            <p class="section-subtitle">Publish articles, study tips, or company news. Edit or delete existing posts.</p>
+                        </div>
+                        <button id="addBlogBtn" class="btn btn-primary">➕ Add Blog Post</button>
+                    </div>
+                    <div class="banners-grid" id="blogGrid">
+                        <!-- Dynamic blog posts will load here -->
                     </div>
                 </section>
             </div>
@@ -435,25 +738,28 @@
                 <form id="bannerForm" enctype="multipart/form-data">
                     <input type="hidden" id="bannerId" name="id">
                     
-                    <!-- Basic Information -->
-                    <div class="form-grid">
-                        <div class="form-group-glass">
-                            <label for="badge_text">Badge Text *</label>
-                            <input type="text" id="badge_text" name="badge_text" required placeholder="e.g. Upcoming Event, Success story">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="badge_class">Badge Theme Class *</label>
-                            <select id="badge_class" name="badge_class" required>
-                                <option value="event-badge">Indigo (Event Theme)</option>
-                                <option value="success-badge">Green (Success Theme)</option>
-                                <option value="announce-badge">Orange (Announcement Theme)</option>
-                            </select>
-                        </div>
-                    </div>
-
+                    <!-- Banner Type Selection -->
                     <div class="form-group-glass">
-                        <label for="title">Title * (Use &lt;span&gt;...&lt;/span&gt; for highlighted text)</label>
-                        <input type="text" id="title" name="title" required placeholder="e.g. Junior Programmer &lt;span&gt;Bootcamp.&lt;/span&gt;">
+                        <label for="banner_type">Banner Type (Internal - for organization) *</label>
+                        <select id="banner_type" name="banner_type" required>
+                            <option value="">-- Select Banner Type --</option>
+                            <option value="program_launch">🚀 New Program Launch</option>
+                            <option value="event_webinar">📅 Event/Webinar</option>
+                            <option value="success_story">⭐ Success Story/Achievement</option>
+                            <option value="promotion">🎁 Limited Offer/Promotion</option>
+                            <option value="announcement">📢 General Announcement</option>
+                            <option value="enrollment">📝 Enrollment Period</option>
+                            <option value="workshop">🎓 Workshop/Training</option>
+                            <option value="testimonial">💬 Testimonial/Review</option>
+                            <option value="other">📌 Other</option>
+                        </select>
+                        <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">This helps organize your banners and filters available CTAs. Not visible to visitors.</p>
+                    </div>
+                    
+                    <!-- Basic Information -->
+                    <div class="form-group-glass">
+                        <label for="title">Title *</label>
+                        <input type="text" id="title" name="title" required placeholder="e.g. Junior Programmer Bootcamp">
                     </div>
 
                     <div class="form-group-glass">
@@ -461,111 +767,149 @@
                         <textarea id="subtitle" name="subtitle" rows="3" required placeholder="Describe the event, announcement or achievement..."></textarea>
                     </div>
 
+                    <div class="form-group-glass">
+                        <label for="badge_text">Badge Text *</label>
+                        <input type="text" id="badge_text" name="badge_text" required placeholder="e.g. Upcoming Event, Success story">
+                    </div>
+
+                    <div class="form-group-glass">
+                        <label for="badge_class">Badge Style *</label>
+                        <select id="badge_class" name="badge_class" required>
+                            <option value="event-badge">🟣 Purple (Events/Upcoming)</option>
+                            <option value="success-badge">🟢 Green (Success/Achievement)</option>
+                            <option value="announce-badge">🟠 Orange (Announcements/Promotions)</option>
+                        </select>
+                        <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Determines the badge color and glow effect of the banner.</p>
+                    </div>
+
                     <!-- Call To Action Buttons -->
-                    <div class="form-grid">
-                        <div class="form-group-glass">
-                            <label for="btn_primary_text">Primary Button Text</label>
-                            <input type="text" id="btn_primary_text" name="btn_primary_text" placeholder="e.g. Enroll Now">
+                    <div class="form-section-header">
+                        <h4 style="color: var(--text-title); font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 18px;">🎯</span> Call-to-Action Buttons
+                        </h4>
+                        <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 16px;">Select action buttons with real functionality (optional)</p>
+                    </div>
+
+                    <!-- Primary Button -->
+                    <div class="cta-button-group">
+                        <div class="cta-button-header">
+                            <label style="font-weight: 600; color: var(--text-title); font-size: 13px; display: flex; align-items: center; gap: 6px;">
+                                <input type="checkbox" id="enable_primary_btn" style="width: 16px; height: 16px; cursor: pointer;">
+                                Enable Primary Button
+                            </label>
                         </div>
-                        <div class="form-group-glass">
-                            <label for="btn_primary_link">Primary Button Link</label>
-                            <input type="text" id="btn_primary_link" name="btn_primary_link" placeholder="e.g. #contact">
+                        <div id="primary_btn_fields" class="cta-fields" style="display: none;">
+                            <div class="form-group-glass">
+                                <label for="btn_primary_action">Primary Action *</label>
+                                <select id="btn_primary_action" name="btn_primary_action">
+                                    <option value="">-- Select Action --</option>
+                                    <optgroup label="📞 Contact & Booking">
+                                        <option value="book_session">Book a Session</option>
+                                        <option value="whatsapp_chat">Chat on WhatsApp</option>
+                                        <option value="call_us">Call Us</option>
+                                        <option value="email_us">Email Us</option>
+                                    </optgroup>
+                                    <optgroup label="📚 Navigation">
+                                        <option value="view_courses">View Our Courses</option>
+                                        <option value="learn_more_about">Learn More About Us</option>
+                                        <option value="view_blog">Read Our Blog</option>
+                                        <option value="view_faq">View FAQs</option>
+                                    </optgroup>
+                                    <optgroup label="📖 Page Sections">
+                                        <option value="scroll_home">Go to Home</option>
+                                        <option value="scroll_about">About Us Section</option>
+                                        <option value="scroll_services">Our Services</option>
+                                        <option value="scroll_contact">Contact Section</option>
+                                    </optgroup>
+                                </select>
+                            </div>
                         </div>
+                    </div>
+
+                    <!-- Secondary Button -->
+                    <div class="cta-button-group">
+                        <div class="cta-button-header">
+                            <label style="font-weight: 600; color: var(--text-title); font-size: 13px; display: flex; align-items: center; gap: 6px;">
+                                <input type="checkbox" id="enable_secondary_btn" style="width: 16px; height: 16px; cursor: pointer;">
+                                Enable Secondary Button
+                            </label>
+                        </div>
+                        <div id="secondary_btn_fields" class="cta-fields" style="display: none;">
+                            <div class="form-group-glass">
+                                <label for="btn_secondary_action">Secondary Action *</label>
+                                <select id="btn_secondary_action" name="btn_secondary_action">
+                                    <option value="">-- Select Action --</option>
+                                    <optgroup label="📞 Contact & Booking">
+                                        <option value="book_session">Book a Session</option>
+                                        <option value="whatsapp_chat">Chat on WhatsApp</option>
+                                        <option value="call_us">Call Us</option>
+                                        <option value="email_us">Email Us</option>
+                                    </optgroup>
+                                    <optgroup label="📚 Navigation">
+                                        <option value="view_courses">View Our Courses</option>
+                                        <option value="learn_more_about">Learn More About Us</option>
+                                        <option value="view_blog">Read Our Blog</option>
+                                        <option value="view_faq">View FAQs</option>
+                                    </optgroup>
+                                    <optgroup label="📖 Page Sections">
+                                        <option value="scroll_home">Go to Home</option>
+                                        <option value="scroll_about">About Us Section</option>
+                                        <option value="scroll_services">Our Services</option>
+                                        <option value="scroll_contact">Contact Section</option>
+                                    </optgroup>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Status -->
+                    <div class="form-group-glass">
+                        <label for="is_active">Status *</label>
+                        <select id="is_active" name="is_active" required>
+                            <option value="1">Show (Active)</option>
+                            <option value="0">Hide (Inactive)</option>
+                        </select>
+                    </div>
+
+                    <!-- Event/Program Duration (When the actual activity happens) -->
+                    <div class="form-section-header">
+                        <h4 style="color: var(--text-title); font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 18px;">📅</span> Event/Program Duration
+                        </h4>
+                        <p style="color: var(--text-muted); font-size: 12px; margin: 0;">When is the actual program/event happening? (e.g., Admissions: Jan 1-15, 2027)</p>
                     </div>
 
                     <div class="form-grid">
                         <div class="form-group-glass">
-                            <label for="btn_secondary_text">Secondary Button Text</label>
-                            <input type="text" id="btn_secondary_text" name="btn_secondary_text" placeholder="e.g. View Syllabus">
+                            <label for="event_start_date">Event/Program Start Date</label>
+                            <input type="date" id="event_start_date" name="event_start_date">
+                            <p class="file-help-text">When does the actual program/event start? (e.g., 2027-01-01)</p>
                         </div>
                         <div class="form-group-glass">
-                            <label for="btn_secondary_link">Secondary Button Link</label>
-                            <input type="text" id="btn_secondary_link" name="btn_secondary_link" placeholder="e.g. #curriculum">
+                            <label for="event_end_date">Event/Program End Date</label>
+                            <input type="date" id="event_end_date" name="event_end_date">
+                            <p class="file-help-text">When does the actual program/event end? (e.g., 2027-01-15)</p>
                         </div>
                     </div>
 
-                    <!-- Stats Fields (Max 3) -->
-                    <div class="form-grid three-cols">
-                        <div class="form-group-glass">
-                            <label for="stat_1_number">Stat 1 Value</label>
-                            <input type="text" id="stat_1_number" name="stat_1_number" placeholder="e.g. June 15 or 98%">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="stat_1_label">Stat 1 Label</label>
-                            <input type="text" id="stat_1_label" name="stat_1_label" placeholder="e.g. Start Date or Highest Score">
-                        </div>
-                    </div>
-
-                    <div class="form-grid three-cols">
-                        <div class="form-group-glass">
-                            <label for="stat_2_number">Stat 2 Value</label>
-                            <input type="text" id="stat_2_number" name="stat_2_number" placeholder="e.g. Ages 8-18">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="stat_2_label">Stat 2 Label</label>
-                            <input type="text" id="stat_2_label" name="stat_2_label" placeholder="e.g. Target Groups">
-                        </div>
-                    </div>
-
-                    <div class="form-grid three-cols">
-                        <div class="form-group-glass">
-                            <label for="stat_3_number">Stat 3 Value</label>
-                            <input type="text" id="stat_3_number" name="stat_3_number" placeholder="e.g. Hands-on">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="stat_3_label">Stat 3 Label</label>
-                            <input type="text" id="stat_3_label" name="stat_3_label" placeholder="e.g. Project Based">
-                        </div>
-                    </div>
-
-                    <!-- Floating Badge & Image -->
-                    <div class="form-grid three-cols">
-                        <div class="form-group-glass">
-                            <label for="floating_icon">Floating Icon (Emoji)</label>
-                            <input type="text" id="floating_icon" name="floating_icon" placeholder="e.g. 💻, 🏆, 🔔">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="floating_title">Floating Title</label>
-                            <input type="text" id="floating_title" name="floating_title" placeholder="e.g. Python & Web">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="floating_desc">Floating Desc</label>
-                            <input type="text" id="floating_desc" name="floating_desc" placeholder="e.g. Weekend Workshops">
-                        </div>
-                    </div>
-
-                    <div class="form-grid three-cols">
-                        <div class="form-group-glass">
-                            <label for="glow_class">Glow & Theme Class *</label>
-                            <select id="glow_class" name="glow_class" required>
-                                <option value="glow-purple">Purple Glow</option>
-                                <option value="glow-green">Green Glow</option>
-                                <option value="glow-orange">Orange Glow</option>
-                            </select>
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="sort_order">Sort/Display Order *</label>
-                            <input type="number" id="sort_order" name="sort_order" required value="0" min="0">
-                        </div>
-                        <div class="form-group-glass">
-                            <label for="is_active">Status *</label>
-                            <select id="is_active" name="is_active" required>
-                                <option value="1">Show (Active)</option>
-                                <option value="0">Hide (Inactive)</option>
-                            </select>
-                        </div>
+                    <!-- Schedule Banner (When the banner displays on the website) -->
+                    <div class="form-section-header">
+                        <h4 style="color: var(--text-title); font-size: 15px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+                            <span style="font-size: 18px;">📺</span> Schedule Banner
+                        </h4>
+                        <p style="color: var(--text-muted); font-size: 12px; margin: 0;">When should this banner appear on the public website? (Leave blank to display permanently)</p>
                     </div>
 
                     <div class="form-grid">
                         <div class="form-group-glass">
-                            <label for="start_date">Schedule Start Date & Time</label>
+                            <label for="start_date">Banner Display Start</label>
                             <input type="datetime-local" id="start_date" name="start_date">
-                            <p class="file-help-text">Leave blank to display immediately.</p>
+                            <p class="file-help-text">Date and time when this banner should start displaying on the website. Leave blank to display immediately.</p>
                         </div>
                         <div class="form-group-glass">
-                            <label for="end_date">Schedule End Date & Time</label>
+                            <label for="end_date">Banner Display End</label>
                             <input type="datetime-local" id="end_date" name="end_date">
-                            <p class="file-help-text">Leave blank to display indefinitely.</p>
+                            <p class="file-help-text">Date and time when this banner should stop displaying. Leave blank to display indefinitely.</p>
                         </div>
                     </div>
 
@@ -588,8 +932,256 @@
         </div>
     </div>
 
+    <!-- Booking Chat Panel (Slide-in) -->
+    <div class="booking-chat-overlay" id="bookingChatOverlay">
+        <div class="booking-chat-panel" id="bookingChatPanel">
+            <div class="chat-panel-header">
+                <div class="chat-panel-title">
+                    <h3 id="chatPanelName">Customer Chat</h3>
+                    <span class="chat-panel-subtitle" id="chatPanelSubtitle">Booking #---</span>
+                </div>
+                <button class="chat-panel-close" id="chatPanelClose">&times;</button>
+            </div>
+            <div class="chat-panel-body" id="chatPanelMessages">
+                <!-- Messages rendered here -->
+            </div>
+            <div class="chat-panel-footer" style="flex-direction: column; align-items: stretch;">
+                <div style="display: flex; gap: 12px; width: 100%;">
+                    <button id="adminChatAttachBtn" class="attach-btn" type="button" title="Attach file">📎</button>
+                    <input type="text" id="adminChatInput" class="chat-panel-input" placeholder="Type a reply..." autocomplete="off">
+                    <button id="adminChatSendBtn" class="chat-panel-send">Send</button>
+                </div>
+                <div id="adminFilePreviewChip" style="display:none;" class="file-preview-chip">
+                    <span>📎</span>
+                    <span class="chip-name" id="adminChipName"></span>
+                    <span class="chip-remove" id="adminChipRemove" title="Remove">✕</span>
+                </div>
+                <input type="file" id="adminFileInput" style="display:none" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.zip">
+            </div>
+        </div>
+    </div>
+
+    <!-- Team Member Add/Edit Modal -->
+    <div class="modal" id="teamModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 id="teamModalTitle">Add Team Member</h3>
+                <button class="modal-close" id="teamModalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="teamForm" enctype="multipart/form-data">
+                    <input type="hidden" id="teamId" name="id">
+                    <div class="form-group-glass">
+                        <label for="team_name">Full Name *</label>
+                        <input type="text" id="team_name" name="name" required placeholder="e.g. Teacher Esther">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="team_role">Role / Position *</label>
+                        <input type="text" id="team_role" name="role" required placeholder="e.g. Lead Mathematics Tutor">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="team_bio">Bio / Description</label>
+                        <textarea id="team_bio" name="bio" rows="4" placeholder="Briefly describe background, credentials, and achievements..."></textarea>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="team_display_order">Display Order</label>
+                        <input type="number" id="team_display_order" name="display_order" value="0" placeholder="0">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="team_image">Photo (Auto-processed)</label>
+                        <input type="file" id="team_image" name="image" accept="image/*">
+                        <p class="file-help-text">Select an avatar/photo. Leave empty when editing to keep current.</p>
+                        <div id="teamImagePreviewContainer" style="display: none; margin-top: 10px;">
+                            <img id="teamImagePreview" src="" alt="Team Member Preview" style="max-height: 100px; border-radius: 8px;">
+                        </div>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-outline" id="teamCancelBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="teamSubmitBtn">Save Team Member</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Course Add/Edit Modal -->
+    <div class="modal" id="courseModal">
+        <div class="modal-card modal-lg">
+            <div class="modal-header">
+                <h3 id="courseModalTitle">Add Course / Program</h3>
+                <button class="modal-close" id="courseModalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="courseForm">
+                    <input type="hidden" id="courseId" name="id">
+                    <div class="form-grid">
+                        <div class="form-group-glass">
+                            <label for="course_title">Program Title *</label>
+                            <input type="text" id="course_title" name="title" required placeholder="e.g. IGCSE Prep & Support">
+                        </div>
+                        <div class="form-group-glass">
+                            <label for="course_grade_levels">Target Grade Levels</label>
+                            <input type="text" id="course_grade_levels" name="grade_levels" placeholder="e.g. Year 9 - Year 11">
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group-glass">
+                            <label for="course_duration">Duration / Frequency</label>
+                            <input type="text" id="course_duration" name="duration" placeholder="e.g. Flexible (hourly/weekly)">
+                        </div>
+                        <div class="form-group-glass">
+                            <label for="course_fees">Fees / Pricing</label>
+                            <input type="text" id="course_fees" name="fees" placeholder="e.g. From KES 2,500/hour">
+                        </div>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="course_subjects">Supported Subjects</label>
+                        <input type="text" id="course_subjects" name="subjects" placeholder="e.g. Mathematics, Physics, Chemistry">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="course_description">Program Description</label>
+                        <textarea id="course_description" name="description" rows="3" placeholder="Describe the program syllabus structure..."></textarea>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="course_outcomes">Learning Outcomes</label>
+                        <textarea id="course_outcomes" name="outcomes" rows="3" placeholder="What will the learner achieve? (Separate by lines or bullet points)"></textarea>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-outline" id="courseCancelBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="courseSubmitBtn">Save Course</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- FAQ Add/Edit Modal -->
+    <div class="modal" id="faqModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 id="faqModalTitle">Add FAQ</h3>
+                <button class="modal-close" id="faqModalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="faqForm">
+                    <input type="hidden" id="faqId" name="id">
+                    <div class="form-group-glass">
+                        <label for="faq_question">Question *</label>
+                        <input type="text" id="faq_question" name="question" required placeholder="e.g. How does scheduling work?">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="faq_answer">Answer *</label>
+                        <textarea id="faq_answer" name="answer" rows="4" required placeholder="Provide a detailed helpful answer..."></textarea>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="faq_category">Category</label>
+                        <select id="faq_category" name="category">
+                            <option value="General">General</option>
+                            <option value="Programs">Programs & Curricula</option>
+                            <option value="Tutors">Tutors & Vetting</option>
+                            <option value="Scheduling">Scheduling & Logistics</option>
+                            <option value="Assessment">Assessment & Progress</option>
+                        </select>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="faq_display_order">Display Order</label>
+                        <input type="number" id="faq_display_order" name="display_order" value="0" placeholder="0">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-outline" id="faqCancelBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="faqSubmitBtn">Save FAQ</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Blog Post Add/Edit Modal -->
+    <div class="modal" id="blogModal">
+        <div class="modal-card modal-lg">
+            <div class="modal-header">
+                <h3 id="blogModalTitle">Add Blog Post</h3>
+                <button class="modal-close" id="blogModalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="blogForm" enctype="multipart/form-data">
+                    <input type="hidden" id="blogId" name="id">
+                    <div class="form-grid">
+                        <div class="form-group-glass">
+                            <label for="blog_title">Post Title *</label>
+                            <input type="text" id="blog_title" name="title" required placeholder="e.g. Choosing the Right Curriculum in Kenya">
+                        </div>
+                        <div class="form-group-glass">
+                            <label for="blog_category">Category</label>
+                            <input type="text" id="blog_category" name="category" placeholder="e.g. Education Trends, Study Tips">
+                        </div>
+                    </div>
+                    <div class="form-grid">
+                        <div class="form-group-glass">
+                            <label for="blog_author">Author</label>
+                            <input type="text" id="blog_author" name="author" value="Admin Team" placeholder="e.g. Admin Team, Esther W.">
+                        </div>
+                        <div class="form-group-glass">
+                            <label for="blog_excerpt">Short Excerpt *</label>
+                            <input type="text" id="blog_excerpt" name="excerpt" required placeholder="A brief summary for previews...">
+                        </div>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="blog_content">Article Content *</label>
+                        <textarea id="blog_content" name="content" rows="12" required placeholder="Write the main blog article content here... (Plain text or markdown)"></textarea>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="blog_image">Featured Image (Auto-processed)</label>
+                        <input type="file" id="blog_image" name="image" accept="image/*">
+                        <p class="file-help-text">Select a featured blog photo. Leave empty when editing to keep current.</p>
+                        <div id="blogImagePreviewContainer" style="display: none; margin-top: 10px;">
+                            <img id="blogImagePreview" src="" alt="Blog Preview" style="max-height: 100px; border-radius: 8px;">
+                        </div>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-outline" id="blogCancelBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="blogSubmitBtn">Publish Post</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Social Media Add/Edit Modal -->
+    <div class="modal" id="socialModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 id="socialModalTitle">Add Social Media Link</h3>
+                <button class="modal-close" id="socialModalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="socialForm">
+                    <input type="hidden" id="socialId" name="id">
+                    <div class="form-group-glass">
+                        <label for="social_name">Platform Name *</label>
+                        <input type="text" id="social_name" name="name" required placeholder="e.g. TikTok, Instagram, X, Facebook, YouTube">
+                        <p class="file-help-text">The name is used to automatically match a branded icon on the website.</p>
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="social_url">Profile URL *</label>
+                        <input type="url" id="social_url" name="url" required placeholder="e.g. https://tiktok.com/@genius.minds.home">
+                    </div>
+                    <div class="form-group-glass">
+                        <label for="social_display_order">Display Order</label>
+                        <input type="number" id="social_display_order" name="display_order" value="0" placeholder="0">
+                        <p class="file-help-text">Lower numbers appear first. Use to control the order of icons.</p>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-outline" id="socialCancelBtn">Cancel</button>
+                        <button type="submit" class="btn btn-primary" id="socialSubmitBtn">Save Social Link</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <!-- External UI chart script from CDN -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="script.js"></script>
+    <script src="script.js?v=3"></script>
 </body>
 </html>

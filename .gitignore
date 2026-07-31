@@ -10,17 +10,23 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Node (If package.json is added in the future)
+# Node dependencies
 node_modules/
 dist/
 build/
 
-# Uploads
-uploads/
-
-# Test files and scratch directory
-scratch/
-
-
-#.env
+# Sensitive environment files (never commit real secrets)
 .env
+.env.production
+.env.example
+
+# Local data files
+mysql_data/
+uploads/
+database.sqlite
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Scratch / temp files
+scratch/
+tmp/
